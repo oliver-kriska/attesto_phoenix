@@ -162,6 +162,17 @@ defmodule AttestoPhoenix.Config do
       The protocol layer injects the authenticated OAuth `client_id` claim
       required by RFC 9068; the callback may omit it or return the same value,
       but a conflicting value fails issuance.
+    * `:authorization_grant_id_claim` - optional access-token claim name for a
+      stable, opaque identifier of the authorization grant. When configured,
+      authorization-code, device-code, and CIBA access tokens carry the same
+      identifier as every access and refresh token descended from that grant;
+      separate grants remain distinct even for the same subject and client.
+      This is useful for grant-scoped resource-server sessions and revocation.
+      It is off by default because it adds a correlation handle to access
+      tokens. Use a collision-resistant claim name under a namespace the host
+      controls, for example `"https://api.example/claims/oauth_grant_id"`.
+      Do not configure `"sid"`: OIDC defines that as the End-User's OP browser
+      session, which is a different lifecycle.
     * `:build_userinfo_claims` - `(subject, granted_scopes, requested_claims ->
       claims_map)`. Produces the claim values the UserInfo endpoint
       (OpenID Connect Core §5.3) returns for the authenticated subject. The
@@ -566,6 +577,7 @@ defmodule AttestoPhoenix.Config do
     :introspection_authorize,
     :principal_kinds,
     :build_principal,
+    :authorization_grant_id_claim,
     :build_userinfo_claims,
     :build_id_token_claims,
     :client_id,
@@ -697,6 +709,7 @@ defmodule AttestoPhoenix.Config do
           introspection_authorize: callback() | nil,
           principal_kinds: [Attesto.PrincipalKind.t()] | callback() | nil,
           build_principal: callback() | nil,
+          authorization_grant_id_claim: String.t() | nil,
           build_userinfo_claims: callback() | nil,
           build_id_token_claims: callback() | nil,
           client_id: callback() | nil,
@@ -1203,6 +1216,16 @@ defmodule AttestoPhoenix.Config do
   @doc "The configured `Attesto.DeviceCodeStore` module, or `nil`."
   @spec device_code_store(t()) :: module() | nil
   def device_code_store(%__MODULE__{device_code_store: store}), do: store
+
+  @doc """
+  The access-token claim name configured for the stable authorization-grant
+  identifier, or `nil` when the claim is disabled.
+
+  The identifier is distinct from the OpenID Connect `sid` browser-session
+  claim. See the module configuration docs for lifecycle and privacy details.
+  """
+  @spec authorization_grant_id_claim(t()) :: String.t() | nil
+  def authorization_grant_id_claim(%__MODULE__{authorization_grant_id_claim: claim}), do: claim
 
   @doc """
   The RFC 8628 §3.2 verification URI shown to the user: the configured
@@ -2435,6 +2458,7 @@ defmodule AttestoPhoenix.Config do
     validate_resource_indicators!(config)
     validate_resource_metadata!(config)
     validate_resource_metadata_resolver!(config)
+    validate_authorization_grant_id_claim!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
@@ -2485,6 +2509,36 @@ defmodule AttestoPhoenix.Config do
     validate_native_apps!(config)
 
     config
+  end
+
+  # The token core owns its registered claims, while AttestoPhoenix owns
+  # `client_id` and the OIDC claims-request passthrough. `sid` is intentionally
+  # rejected even though it is not a core access-token claim: OIDC gives it the
+  # incompatible meaning of an OP browser session identifier. A configured
+  # grant-id name must not silently shadow any of those values.
+  @authorization_grant_id_claim_conflicts ~w(
+    iss aud exp iat jti sub scope typ cnf acr auth_time principal_kind
+    client_id claims sid
+  )
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: nil}), do: :ok
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: claim})
+       when is_binary(claim) and claim != "" do
+    if claim in @authorization_grant_id_claim_conflicts do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :authorization_grant_id_claim #{inspect(claim)} collides " <>
+              "with a protocol- or library-owned claim. Configure a collision-resistant " <>
+              "claim name under a namespace the host controls; do not reuse OIDC sid."
+    end
+
+    :ok
+  end
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: claim}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :authorization_grant_id_claim must be nil or a non-empty " <>
+            "string naming the access-token claim; got #{inspect(claim)}."
   end
 
   # `:native_apps` carries exactly two members, both booleans, and one of them

@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add opt-in `:authorization_grant_id_claim` configuration. When enabled,
+  authorization-code, device-code, and CIBA access tokens expose the stable,
+  opaque identifier shared by their descendant refresh-token family. Refresh
+  rotation and retry retain it, separate grants for the same subject/client
+  remain distinct, and token exchange preserves the verified subject token's
+  identifier. This gives protected resources a signed grant-scoped correlation
+  handle without conflating it with an access token's `jti` or the OIDC browser
+  session `sid`. The feature is disabled by default and the host controls the
+  private claim name.
+
 ## [2.6.0] - 2026-08-02
 
 ### Security

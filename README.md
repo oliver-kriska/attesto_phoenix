@@ -192,6 +192,8 @@ config :my_app, AttestoPhoenix.Config,
   access_token_ttl: 900,
   refresh_token_ttl: 1_209_600,
   authorization_code_ttl: 60,
+  # Optional private claim linking access tokens from one authorization grant.
+  authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id",
   dpop_enabled: true,
   dpop_nonce_required: false,
   mtls_enabled: false,                 # if true, also set :cert_der
@@ -213,6 +215,37 @@ config = AttestoPhoenix.Config.from_otp_app(:my_app)
 Required keys are validated at build time; a missing key (or a missing
 dependency such as `:cert_der` when mTLS is enabled) raises immediately so
 misconfiguration fails fast.
+
+### Authorization-grant identity
+
+Set `:authorization_grant_id_claim` when a protected resource needs to group
+all access tokens descended from one user authorization independently of both
+the subject and each token's `jti`:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id"
+```
+
+The configured private claim is off by default. When enabled, the library — not
+the host's `:build_principal` callback — stamps its value from trusted grant
+state. It is stable across the initial authorization-code, device-code, or CIBA
+access token, refresh rotation and retry, and token exchange. Separate grants
+remain distinct even when their subject and client are the same. The matching
+refresh-token records use the same identifier as their `family_id`.
+
+This is useful for resource-server sessions such as long-lived Phoenix sockets:
+the resource server can key a session by `{issuer, authorization_grant_id}` and
+disconnect every socket descended from the grant when that exact grant is
+revoked. The claim is only a signed correlation handle, however; it does not
+prove that a refresh family remains active and does not replace access-token
+signature, issuer, audience, scope, sender-constraint, expiry, or `jti`
+revocation checks.
+
+Choose a collision-resistant claim name under a namespace you control. Do not
+use `sid`: OpenID Connect defines `sid` as the End-User's OP browser-session
+identifier, whose lifecycle is different. Treat the configured claim as
+potentially correlating: expose it only to intended access-token audiences.
 
 ### Resource indicators (RFC 8707)
 
