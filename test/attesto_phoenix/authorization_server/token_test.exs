@@ -977,7 +977,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "token exchange grant (RFC 8693)" do
-    test "an exchanged token preserves its subject token's authorization-grant id" do
+    test "an exchanged token does not inherit its subject token's authorization-grant id" do
       family_id = "grant-family-exchange"
       code_store = start_code_store("oc_user-1", ["read"], family_id: family_id)
 
@@ -1010,7 +1010,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
         )
 
       assert {:ok, exchanged, _events} = Token.issue(config, exchange_request)
-      assert claim!(exchanged.access_token, @authorization_grant_id_claim) == family_id
+      refute claim!(exchanged.access_token, @authorization_grant_id_claim)
     end
 
     test "a token_exchange token_issued event carries bearer sender metadata" do

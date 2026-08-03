@@ -230,9 +230,11 @@ config :my_app, AttestoPhoenix.Config,
 The configured private claim is off by default. When enabled, the library — not
 the host's `:build_principal` callback — stamps its value from trusted grant
 state. It is stable across the initial authorization-code, device-code, or CIBA
-access token, refresh rotation and retry, and token exchange. Separate grants
-remain distinct even when their subject and client are the same. The matching
-refresh-token records use the same identifier as their `family_id`.
+access token and refresh rotation and retry. Separate grants remain distinct
+even when their subject and client are the same. The matching refresh-token
+records use the same identifier as their `family_id`. Token exchange omits the
+claim: the exchange is a distinct authorization grant, not a refresh descendant
+of its subject token.
 
 This is useful for resource-server sessions such as long-lived Phoenix sockets:
 the resource server can key a session by `{issuer, authorization_grant_id}` and

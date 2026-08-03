@@ -1384,7 +1384,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
            scopes: scope,
            claims:
              claims
-             |> exchange_extra_claims(kind_claim)
+             |> exchange_extra_claims(kind_claim, config)
              |> Map.put("client_id", authenticated_client_id)
          },
          {:ok, minted} <-
@@ -1407,12 +1407,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp exchange_extra_claims(claims, principal_kind_claim) do
+  defp exchange_extra_claims(claims, principal_kind_claim, config) do
     # `acr` / `auth_time` are reserved: an exchanged (machine-authorized) token
     # must not inherit the subject token's authentication context, which would
     # let token exchange forge a step-up-satisfying token (RFC 9470).
     reserved =
-      MapSet.new(~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++ [principal_kind_claim])
+      MapSet.new(
+        ~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++
+          [principal_kind_claim, Config.authorization_grant_id_claim(config)]
+      )
 
     claims
     |> Enum.reject(fn {key, _value} -> MapSet.member?(reserved, key) end)
