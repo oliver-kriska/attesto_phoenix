@@ -168,6 +168,10 @@ defmodule AttestoPhoenix.Config do
       identifier as every access and refresh token descended from that grant;
       separate grants remain distinct even for the same subject and client.
       This is useful for grant-scoped resource-server sessions and revocation.
+      If policy declines refresh-token issuance, the access-token claim still
+      identifies the grant, but no persisted refresh family exists to query or
+      revoke; a resource server that requires family-state enforcement must
+      limit the feature to refresh-capable grants.
       It is off by default because it adds a correlation handle to access
       tokens. Use a collision-resistant claim name under a namespace the host
       controls, for example `"https://api.example/claims/oauth_grant_id"`.

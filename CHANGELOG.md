@@ -16,7 +16,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   identifier because it is a separate grant. This gives protected resources a
   signed grant-scoped correlation handle without conflating it with an access
   token's `jti` or the OIDC browser session `sid`. The feature is disabled by
-  default and the host controls the private claim name.
+  default and the host controls the private claim name. A grant for which host
+  policy declines refresh-token issuance still receives the access-token claim,
+  but has no persisted refresh family to query or revoke.
 
 ## [2.6.0] - 2026-08-02
 

@@ -234,7 +234,10 @@ access token and refresh rotation and retry. Separate grants remain distinct
 even when their subject and client are the same. The matching refresh-token
 records use the same identifier as their `family_id`. Token exchange omits the
 claim: the exchange is a distinct authorization grant, not a refresh descendant
-of its subject token.
+of its subject token. If host policy declines refresh-token issuance, the claim
+still identifies the access-token grant but no persisted refresh family exists
+to query or revoke. Resource servers requiring family-state enforcement must
+therefore use it only for refresh-capable grants.
 
 This is useful for resource-server sessions such as long-lived Phoenix sockets:
 the resource server can key a session by `{issuer, authorization_grant_id}` and
