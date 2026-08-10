@@ -506,6 +506,267 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
   end
 
+  describe "current endpoint client-authentication policy matrix" do
+    @endpoint_matrix [
+      {:token, true},
+      {:par, false},
+      {:introspection, false},
+      {:device_authorization, true},
+      {:backchannel_authentication, false}
+    ]
+
+    @all_methods [
+      :client_secret_basic,
+      :client_secret_post,
+      :private_key_jwt,
+      :attest_jwt_client_auth,
+      :none
+    ]
+
+    test "pins the accepted and rejected methods for every policy endpoint", %{config: config} do
+      config = %{
+        config
+        | client_auth_signing_algs: Attesto.SigningAlg.fapi_algs(),
+          client_auth_enforce_fapi_alg_policy: true
+      }
+
+      for {endpoint, allow_public} <- @endpoint_matrix do
+        policy = Policy.for_endpoint(config, endpoint)
+        expected_methods = if allow_public, do: @all_methods, else: @all_methods -- [:none]
+
+        assert policy.allow_public == allow_public
+        assert policy.assertion_max_lifetime == 300
+        assert policy.assertion_signing_algs == config.client_auth_signing_algs
+        assert policy.assertion_enforce_fapi_alg_policy == config.client_auth_enforce_fapi_alg_policy
+
+        expected_audiences =
+          case endpoint do
+            :token ->
+              Config.client_assertion_audiences(config)
+
+            :backchannel_authentication ->
+              [
+                config.issuer,
+                Config.token_endpoint_url(config),
+                Config.backchannel_authentication_endpoint_url(config)
+              ]
+
+            _other ->
+              [config.issuer]
+          end
+
+        assert policy.assertion_audiences == expected_audiences
+
+        for method <- @all_methods do
+          result = authenticate_endpoint_method(method, policy, config)
+
+          if method in expected_methods do
+            assert {:ok, %Result{method: ^method}} = result
+          else
+            assert {:error,
+                    %OAuthError{
+                      error: :invalid_client,
+                      error_description: "client authentication required"
+                    }} = result
+          end
+        end
+      end
+    end
+
+    defp authenticate_endpoint_method(:client_secret_basic, policy, config) do
+      config = %{config | token_endpoint_auth_methods_supported: ["client_secret_basic"]}
+      ClientAuthentication.authenticate(basic("confidential-1", "s3cr3t"), %{}, config, policy)
+    end
+
+    defp authenticate_endpoint_method(:client_secret_post, policy, config) do
+      config = %{config | token_endpoint_auth_methods_supported: ["client_secret_post"]}
+
+      ClientAuthentication.authenticate(
+        [],
+        %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"},
+        config,
+        policy
+      )
+    end
+
+    defp authenticate_endpoint_method(:private_key_jwt, policy, config) do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      config = %{
+        config
+        | token_endpoint_auth_methods_supported: ["private_key_jwt"],
+          client_jwks: fn @confidential -> %{"keys" => [public_jwk(client_key)]} end
+      }
+
+      ClientAuthentication.authenticate([], assertion_params(client_key, "ES256"), config, policy)
+    end
+
+    defp authenticate_endpoint_method(:attest_jwt_client_auth, policy, config) do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      config = %{
+        config
+        | token_endpoint_auth_methods_supported: ["attest_jwt_client_auth"],
+          trusted_wallet_provider_jwks: %{"keys" => [public_jwk(wallet_provider_key)]}
+      }
+
+      ClientAuthentication.authenticate(
+        wallet_attestation_headers(wallet_provider_key, instance_key, "confidential-1"),
+        %{},
+        config,
+        policy
+      )
+    end
+
+    defp authenticate_endpoint_method(:none, policy, config) do
+      config = %{config | token_endpoint_auth_methods_supported: ["none"]}
+
+      ClientAuthentication.authenticate(
+        [],
+        %{"client_id" => "public-1"},
+        config,
+        policy
+      )
+    end
+  end
+
+  describe "attest_jwt_client_auth" do
+    test "authenticates as the verified attestation sub", %{config: config} do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      config = trust_wallet_provider(config, wallet_provider_key)
+
+      assert {:ok,
+              %Result{
+                client: @confidential,
+                client_id: "confidential-1",
+                method: :attest_jwt_client_auth
+              }} =
+               authenticate(
+                 wallet_attestation_headers(wallet_provider_key, instance_key, "confidential-1"),
+                 %{},
+                 config,
+                 allow_public: false
+               )
+    end
+
+    test "allows a native public wallet because the attestation proves an instance key", %{config: config} do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      config = trust_wallet_provider(config, wallet_provider_key)
+
+      assert {:ok, %Result{client: @native_public, method: :attest_jwt_client_auth}} =
+               authenticate(
+                 wallet_attestation_headers(wallet_provider_key, instance_key, "native-public-1"),
+                 %{},
+                 config,
+                 allow_public: false
+               )
+    end
+
+    test "rejects wrong-key and expired attestations and an invalid PoP", %{config: config} do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      wrong_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      wrong_instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      config = trust_wallet_provider(config, wallet_provider_key)
+
+      invalid_headers = [
+        wallet_attestation_headers(wrong_provider_key, instance_key, "confidential-1"),
+        wallet_attestation_headers(wallet_provider_key, instance_key, "confidential-1", %{"exp" => 0}),
+        wallet_attestation_headers(
+          wallet_provider_key,
+          instance_key,
+          "confidential-1",
+          %{},
+          wrong_instance_key
+        )
+      ]
+
+      for headers <- invalid_headers do
+        headers
+        |> authenticate(%{}, config, allow_public: false)
+        |> assert_generic_invalid_client()
+      end
+    end
+
+    test "requires both headers and rejects mixing with another authentication method", %{config: config} do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      config = trust_wallet_provider(config, wallet_provider_key)
+      headers = wallet_attestation_headers(wallet_provider_key, instance_key, "confidential-1")
+
+      headers
+      |> Map.put(:oauth_client_attestation_pop, [])
+      |> authenticate(%{}, config, allow_public: false)
+      |> assert_generic_invalid_client()
+
+      assert {:error, %OAuthError{error: :invalid_request}} =
+               headers
+               |> Map.put(:authorization, basic("confidential-1", "s3cr3t"))
+               |> authenticate(%{}, config, allow_public: false)
+    end
+
+    test "absent attestation headers leave Basic authentication unchanged", %{config: config} do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      config = trust_wallet_provider(config, wallet_provider_key)
+
+      assert {:ok, %Result{method: :client_secret_basic}} =
+               authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: false)
+    end
+  end
+
+  describe "revocation endpoint client-authentication policy" do
+    test "allows only Basic/post and gives Basic precedence over body credentials", %{
+      config: config
+    } do
+      policy = Policy.for_endpoint(config, :revocation)
+
+      assert policy.allow_public == false
+      assert policy.assertion_audiences == []
+      assert policy.allowed_methods == [:client_secret_basic, :client_secret_post]
+      assert policy.basic_precedence == true
+      # Revocation historically accepted Basic/post independently of the
+      # token endpoint's configured method advertisement.
+      assert policy.honor_configured_methods == false
+
+      config = %{config | token_endpoint_auth_methods_supported: ["private_key_jwt"]}
+
+      assert {:ok, %Result{method: :client_secret_basic}} =
+               ClientAuthentication.authenticate(
+                 basic("confidential-1", "s3cr3t"),
+                 %{
+                   "client_id" => "confidential-1",
+                   "client_secret" => "wrong",
+                   "client_assertion" => "ignored"
+                 },
+                 config,
+                 policy
+               )
+
+      assert {:ok, %Result{method: :client_secret_post}} =
+               ClientAuthentication.authenticate(
+                 [],
+                 %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"},
+                 config,
+                 policy
+               )
+
+      assert {:error, %OAuthError{error: :invalid_client}} =
+               ClientAuthentication.authenticate(
+                 [],
+                 %{
+                   "client_id" => "confidential-1",
+                   "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+                   "client_assertion" => "not-used-by-revocation"
+                 },
+                 config,
+                 policy
+               )
+    end
+  end
+
   defp authenticate(headers, params, config, opts) do
     policy = %Policy{
       allow_public: Keyword.fetch!(opts, :allow_public),
@@ -552,6 +813,65 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     }
 
     header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
+    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+    compact
+  end
+
+  defp trust_wallet_provider(config, wallet_provider_key) do
+    %{config | trusted_wallet_provider_jwks: %{"keys" => [public_jwk(wallet_provider_key)]}}
+  end
+
+  defp wallet_attestation_headers(
+         wallet_provider_key,
+         instance_key,
+         client_id,
+         attestation_overrides \\ %{},
+         pop_signing_key \\ nil
+       ) do
+    now = System.system_time(:second)
+    pop_signing_key = pop_signing_key || instance_key
+
+    attestation_claims =
+      Map.merge(
+        %{
+          "sub" => client_id,
+          "iat" => now,
+          "exp" => now + 300,
+          "cnf" => %{"jwk" => public_jwk(instance_key)}
+        },
+        attestation_overrides
+      )
+
+    attestation =
+      sign_jwt(
+        wallet_provider_key,
+        %{
+          "alg" => "ES256",
+          "typ" => "oauth-client-attestation+jwt",
+          "kid" => JOSE.JWK.thumbprint(wallet_provider_key)
+        },
+        attestation_claims
+      )
+
+    pop =
+      sign_jwt(
+        pop_signing_key,
+        %{"alg" => "ES256", "typ" => "oauth-client-attestation-pop+jwt"},
+        %{
+          "aud" => "https://issuer.example",
+          "iat" => now,
+          "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+        }
+      )
+
+    %{
+      authorization: [],
+      oauth_client_attestation: [attestation],
+      oauth_client_attestation_pop: [pop]
+    }
+  end
+
+  defp sign_jwt(jwk, header, claims) do
     {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
     compact
   end

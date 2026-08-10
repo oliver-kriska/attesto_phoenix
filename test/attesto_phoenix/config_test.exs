@@ -1,9 +1,39 @@
 defmodule AttestoPhoenix.ConfigTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.Config
+
+  defmodule Keystore do
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem, do: "main-pem"
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
+  defmodule VcKeystore do
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem, do: "vc-pem"
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
+  defmodule VerifierEncryptionKeystore do
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem, do: "verifier-encryption-pem"
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
 
   # A behaviour module that implements every ClientStore callback the resolver
   # routes through `:client_store`, plus the principal/scope/event/consent/
@@ -131,6 +161,53 @@ defmodule AttestoPhoenix.ConfigTest do
     ]
 
     Config.new(Keyword.merge(base, overrides))
+  end
+
+  describe "credential-signing keystore" do
+    test "falls back to the main keystore when vc_keystore is unset" do
+      cfg = config()
+
+      assert Config.keystore(cfg) == Keystore
+      assert Config.vc_keystore(cfg) == Keystore
+      assert Config.vc_signing_pem(cfg) == "main-pem"
+    end
+
+    test "uses a separately configured vc_keystore" do
+      cfg = config(vc_keystore: VcKeystore)
+
+      assert Config.keystore(cfg) == Keystore
+      assert Config.vc_keystore(cfg) == VcKeystore
+      assert Config.vc_signing_pem(cfg) == "vc-pem"
+    end
+  end
+
+  describe "ecto_repo!/0" do
+    setup do
+      previous = Application.get_env(:attesto_phoenix, :repo)
+
+      on_exit(fn ->
+        case previous do
+          nil -> Application.delete_env(:attesto_phoenix, :repo)
+          repo -> Application.put_env(:attesto_phoenix, :repo, repo)
+        end
+      end)
+
+      :ok
+    end
+
+    test "returns the configured repository" do
+      Application.put_env(:attesto_phoenix, :repo, __MODULE__.Repo)
+
+      assert Config.ecto_repo!() == __MODULE__.Repo
+    end
+
+    test "raises when the repository is unset" do
+      Application.delete_env(:attesto_phoenix, :repo)
+
+      assert_raise ArgumentError,
+                   "AttestoPhoenix: no :repo configured. Set `config :attesto_phoenix, repo: MyApp.Repo`",
+                   &Config.ecto_repo!/0
+    end
   end
 
   describe "resolve_callback/2 precedence" do
@@ -425,7 +502,16 @@ defmodule AttestoPhoenix.ConfigTest do
     end
 
     test "rejects empty, non-string, protocol-owned, and OIDC sid names" do
-      for invalid <- ["", :grant_id, "jti", "client_id", "claims", "sid"] do
+      for invalid <- [
+            "",
+            :grant_id,
+            "nbf",
+            "jti",
+            "client_id",
+            "claims",
+            "credential_configuration_ids",
+            "sid"
+          ] do
         assert_raise ArgumentError, ~r/:authorization_grant_id_claim/, fn ->
           config(authorization_grant_id_claim: invalid)
         end
@@ -664,6 +750,15 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe ":trusted_wallet_provider_jwks" do
+    test "is optional and exposes configured Wallet Provider keys" do
+      jwks = %{"keys" => [%{"kty" => "EC", "crv" => "P-256", "x" => "x", "y" => "y"}]}
+
+      assert Config.trusted_wallet_provider_jwks(config()) == nil
+      assert Config.trusted_wallet_provider_jwks(config(trusted_wallet_provider_jwks: jwks)) == jwks
+    end
+  end
+
   describe "CIBA algorithm policy" do
     test "the default FAPI-CIBA allowlist retains the FAPI key gate" do
       opts = Config.ciba(config())
@@ -807,6 +902,9 @@ defmodule AttestoPhoenix.ConfigTest do
       assert native_apps[:loopback_redirect] == true
       # §8.12 is a heuristic SHOULD, so it stays a genuine opt-in.
       assert native_apps[:reject_embedded_user_agents] == false
+      # Widening §7.3 to the `localhost` name goes past the MUST, so it too is
+      # a genuine opt-in.
+      assert native_apps[:loopback_include_localhost] == false
     end
 
     test "merges host overrides over the defaults, leaving unset members defaulted" do
@@ -829,6 +927,23 @@ defmodule AttestoPhoenix.ConfigTest do
       refute Config.reject_embedded_user_agents?(config())
       refute Config.reject_embedded_user_agents?(config(native_apps: [loopback_redirect: true]))
       assert Config.reject_embedded_user_agents?(config(native_apps: [reject_embedded_user_agents: true]))
+    end
+
+    test "native_app_loopback_matching/1 is an opt-in for the localhost name" do
+      assert Config.native_app_loopback_matching(config()) == :exact_allow_loopback_port
+      assert Config.native_app_loopback_matching(config(native_apps: [])) == :exact_allow_loopback_port
+
+      assert Config.native_app_loopback_matching(config(native_apps: [loopback_include_localhost: false])) ==
+               :exact_allow_loopback_port
+
+      assert Config.native_app_loopback_matching(config(native_apps: [loopback_include_localhost: true])) ==
+               :exact_allow_loopback_port_including_localhost
+    end
+
+    test "rejects a non-boolean :loopback_include_localhost rather than failing open" do
+      assert_raise ArgumentError, ~r/:native_apps :loopback_include_localhost must be true or false/, fn ->
+        config(native_apps: [loopback_include_localhost: "true"])
+      end
     end
 
     # `:loopback_redirect` is the switch an operator reaches for to FORBID a
@@ -856,7 +971,7 @@ defmodule AttestoPhoenix.ConfigTest do
       end
     end
 
-    test "the two members are independent" do
+    test "the loopback opt-out and embedded-user-agent flag are independent" do
       config = config(native_apps: [loopback_redirect: false, reject_embedded_user_agents: true])
 
       refute Config.native_app_loopback_redirect?(config)
@@ -1060,6 +1175,18 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.token_path(built) == "/mcp/oauth/token"
       assert Config.par_path(built) == "/mcp/oauth/par"
+      assert Config.credential_path(built) == "/mcp/oauth/credential"
+      assert Config.nonce_path(built) == "/mcp/oauth/nonce"
+      assert Config.status_list_path(built) == "/mcp/oauth/statuslist"
+      assert Config.credential_offer_path(built) == "/mcp/oauth/credential_offer"
+      assert Config.deferred_credential_path(built) == "/mcp/oauth/deferred_credential"
+
+      assert Config.credential_endpoint_url(built) == "https://issuer.example/mcp/oauth/credential"
+      assert Config.nonce_endpoint_url(built) == "https://issuer.example/mcp/oauth/nonce"
+      assert Config.status_list_endpoint_url(built) == "https://issuer.example/mcp/oauth/statuslist"
+
+      assert Config.deferred_credential_endpoint_url(built) ==
+               "https://issuer.example/mcp/oauth/deferred_credential"
     end
 
     test "a custom prefix with an override that stays under the prefix builds" do
@@ -1093,6 +1220,99 @@ defmodule AttestoPhoenix.ConfigTest do
       built = config(token_path: "/custom/token")
 
       assert Config.token_path(built) == "/custom/token"
+    end
+  end
+
+  describe "OID4VP verifier configuration" do
+    test "exposes verifier identity settings and convention-derived URLs" do
+      certificate_der = <<1, 2, 3>>
+
+      built =
+        config(
+          oauth_path_prefix: "/wallet/oauth",
+          presentation_session_store: __MODULE__.PresentationStore,
+          verifier_encryption_keystore: VerifierEncryptionKeystore,
+          verifier_client_id: "verifier-client-1",
+          verifier_client_id_scheme: "x509_san_dns",
+          verifier_x5c: [certificate_der],
+          verifier_dns: "verifier.example"
+        )
+
+      assert Config.presentation_session_store(built) == __MODULE__.PresentationStore
+      assert Config.verifier_encryption_keystore(built) == VerifierEncryptionKeystore
+      assert Config.verifier_client_id(built) == "verifier-client-1"
+      assert Config.verifier_client_id_scheme(built) == "x509_san_dns"
+      assert Config.verifier_x5c(built) == [certificate_der]
+      assert Config.verifier_dns(built) == "verifier.example"
+      assert Config.presentation_response_mode(built) == "direct_post"
+      assert Config.presentation_request_path(built) == "/wallet/oauth/presentation_request"
+      assert Config.presentation_response_path(built) == "/wallet/oauth/presentation_response"
+
+      assert Config.presentation_request_endpoint_url(built) ==
+               "https://issuer.example/wallet/oauth/presentation_request"
+
+      assert Config.presentation_response_endpoint_url(built) ==
+               "https://issuer.example/wallet/oauth/presentation_response"
+    end
+
+    test "keeps verifier-only settings optional for non-presentation hosts" do
+      built = config()
+
+      assert Config.presentation_session_store(built) == nil
+      assert Config.verifier_encryption_keystore(built) == nil
+      assert Config.verifier_client_id(built) == nil
+      assert Config.verifier_client_id_scheme(built) == nil
+      assert Config.verifier_x5c(built) == nil
+      assert Config.verifier_dns(built) == nil
+      assert Config.presentation_response_mode(built) == "direct_post"
+    end
+
+    test "rejects a configured verifier client id that is not a non-empty string" do
+      for invalid <- ["", :verifier, 123] do
+        assert_raise ArgumentError, ~r/:verifier_client_id must be a non-empty string/, fn ->
+          config(verifier_client_id: invalid)
+        end
+      end
+    end
+
+    test "accepts only the supported presentation response modes" do
+      assert Config.presentation_response_mode(config(presentation_response_mode: "direct_post.jwt")) ==
+               "direct_post.jwt"
+
+      for invalid <- ["", "query.jwt", :direct_post, nil] do
+        assert_raise ArgumentError, ~r/:presentation_response_mode must be/, fn ->
+          config(presentation_response_mode: invalid)
+        end
+      end
+    end
+
+    test "accepts only supported verifier client-id schemes" do
+      assert Config.verifier_client_id_scheme(config(verifier_client_id_scheme: "redirect_uri")) ==
+               "redirect_uri"
+
+      assert Config.verifier_client_id_scheme(config(verifier_client_id_scheme: "x509_san_dns")) ==
+               "x509_san_dns"
+
+      for invalid <- ["", "did", :x509_san_dns] do
+        assert_raise ArgumentError, ~r/:verifier_client_id_scheme must be/, fn ->
+          config(verifier_client_id_scheme: invalid)
+        end
+      end
+    end
+
+    test "validates configured verifier certificate and DNS value types" do
+      assert Config.verifier_x5c(config(verifier_x5c: [])) == []
+      assert Config.verifier_dns(config(verifier_dns: "")) == ""
+
+      for invalid <- [:certificate, [""], [123]] do
+        assert_raise ArgumentError, ~r/:verifier_x5c must be/, fn ->
+          config(verifier_x5c: invalid)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:verifier_dns must be/, fn ->
+        config(verifier_dns: :verifier)
+      end
     end
   end
 

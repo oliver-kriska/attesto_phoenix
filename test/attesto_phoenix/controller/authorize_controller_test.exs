@@ -518,6 +518,104 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert location(conn) == nil
     end
 
+    # Claude Code requests the LOCALHOST member of its document, not the IP
+    # literal, so the strict default refuses it (the test above). The opt-in
+    # has to carry the whole flow: the match (port flexibility for the name),
+    # the native signal (a localhost URI counts as declaring loopback), and the
+    # same-origin exemption (a localhost redirect is exempt like the literals).
+    test "the localhost opt-in serves Claude Code's actual request shape" do
+      client_id = unique_cimd_client_id()
+
+      script_doc(
+        client_id,
+        cimd_doc(%{"redirect_uris" => ["http://localhost/callback", "http://127.0.0.1/callback"]})
+      )
+
+      put_config(
+        client_id_metadata: cimd_config(),
+        native_apps: [loopback_include_localhost: true]
+      )
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost:3118/callback"}))
+
+      assert conn.status == 302, "expected the localhost loopback flow to be served, got: #{conn.resp_body}"
+      assert location(conn) =~ "http://localhost:3118/callback"
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    test "the localhost opt-in serves a localhost-ONLY document too" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => ["http://localhost/callback"]}))
+
+      put_config(
+        client_id_metadata: cimd_config(),
+        native_apps: [loopback_include_localhost: true]
+      )
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost:51353/callback"}))
+
+      assert conn.status == 302
+      assert location(conn) =~ "http://localhost:51353/callback"
+    end
+
+    test "the loopback kill switch disables the localhost same-origin exemption" do
+      client_id = unique_cimd_client_id()
+      redirect_uri = "http://localhost:51353/callback"
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => [redirect_uri]}))
+
+      put_config(
+        client_id_metadata: cimd_config(),
+        native_apps: [loopback_redirect: false, loopback_include_localhost: true]
+      )
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => redirect_uri}))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    test "the kill switch preserves the exact IP-literal same-origin exemption" do
+      client_id = unique_cimd_client_id()
+      redirect_uri = "http://127.0.0.1:51353/callback"
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => [redirect_uri]}))
+
+      put_config(
+        client_id_metadata: cimd_config(),
+        native_apps: [loopback_redirect: false, loopback_include_localhost: true]
+      )
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => redirect_uri}))
+
+      assert conn.status == 302
+      assert location(conn) =~ redirect_uri
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    # The opt-in widens which hosts count as loopback, nothing else: an https
+    # redirect from a CIMD document is still held to same origin, and a
+    # lookalike host gets neither port flexibility nor the exemption.
+    test "the localhost opt-in does not widen anything but the name" do
+      client_id = unique_cimd_client_id()
+
+      script_doc(
+        client_id,
+        cimd_doc(%{"redirect_uris" => ["https://elsewhere.example/cb", "http://localhost.evil.example/callback"]})
+      )
+
+      put_config(
+        client_id_metadata: cimd_config(),
+        native_apps: [loopback_include_localhost: true]
+      )
+
+      cross_origin = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"}))
+      assert cross_origin.status == 400
+
+      lookalike =
+        call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost.evil.example:3118/callback"}))
+
+      assert lookalike.status == 400
+    end
+
     test "resolves a CIMD client_id and issues a code" do
       client_id = unique_cimd_client_id()
       script_doc(client_id, cimd_doc())
@@ -1451,6 +1549,85 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
                })
 
       assert grant.family_id == family_id
+    end
+  end
+
+  # ── OID4VCI authorization_details (draft-ietf-oauth-openid4vci §5) ─────────
+
+  describe "OID4VCI authorization_details" do
+    @credential_configurations_supported %{
+      "UniversityDegreeCredential" => %{format: "vc+sd-jwt"}
+    }
+
+    defp authorization_details_json(entries), do: JSON.encode!(entries)
+
+    test "openid_credential authorization_details for a supported configuration id are recorded onto the code" do
+      put_config(credential_configurations_supported: @credential_configurations_supported)
+
+      details =
+        authorization_details_json([
+          %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegreeCredential"}
+        ])
+
+      conn = call(valid_params(%{"authorization_details" => details}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      assert record.data.claims["credential_configuration_ids"] == ["UniversityDegreeCredential"]
+    end
+
+    test "an authorization_details entry naming an unconfigured credential id is dropped" do
+      put_config(credential_configurations_supported: @credential_configurations_supported)
+
+      details =
+        authorization_details_json([
+          %{"type" => "openid_credential", "credential_configuration_id" => "SomeUnofferedCredential"}
+        ])
+
+      conn = call(valid_params(%{"authorization_details" => details}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "credential_configuration_ids")
+    end
+
+    test "authorization_details is ignored entirely when credential issuance is not configured" do
+      # base_config/1 configures no :credential_configurations_supported.
+      details =
+        authorization_details_json([
+          %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegreeCredential"}
+        ])
+
+      conn = call(valid_params(%{"authorization_details" => details}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "credential_configuration_ids")
+    end
+
+    test "a request with no authorization_details is completely unaffected" do
+      put_config(credential_configurations_supported: @credential_configurations_supported)
+
+      conn = call(valid_params())
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "credential_configuration_ids")
+    end
+
+    test "a non-openid_credential authorization_details entry is ignored" do
+      put_config(credential_configurations_supported: @credential_configurations_supported)
+
+      details =
+        authorization_details_json([
+          %{"type" => "payment_initiation", "credential_configuration_id" => "UniversityDegreeCredential"}
+        ])
+
+      conn = call(valid_params(%{"authorization_details" => details}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "credential_configuration_ids")
     end
   end
 

@@ -24,12 +24,12 @@ defmodule AttestoPhoenix.Controller.TokenController do
   ## Client authentication
 
   Accepts HTTP Basic credentials (RFC 6749 §2.3.1, RFC 7617), request-body
-  credentials (RFC 6749 §2.3.1), and `private_key_jwt` assertions (RFC 7523 /
-  OIDC Core §9). Presenting more than one client-authentication method is
-  rejected (RFC 6749 §2.3). Confidential clients must authenticate; a client
-  identified without a secret/assertion is admitted only when the host's
-  `:client_public?` callback marks it public, in which case it relies on PKCE
-  (RFC 7636) instead.
+  credentials (RFC 6749 §2.3.1), `private_key_jwt` assertions (RFC 7523 / OIDC
+  Core §9), and Client Attestation JWT + PoP header pairs. Presenting more than
+  one client-authentication method is rejected (RFC 6749 §2.3). Confidential
+  clients must authenticate; a client identified without a secret/assertion is
+  admitted only when the host's `:client_public?` callback marks it public, in
+  which case it relies on PKCE (RFC 7636) instead.
 
   ## Responses
 
@@ -54,14 +54,10 @@ defmodule AttestoPhoenix.Controller.TokenController do
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, Event, OAuthError, RequestContext}
-  alias AttestoPhoenix.ClientAuthentication.{ErrorContext, Policy}
+  alias AttestoPhoenix.ClientAuthentication.ErrorContext
   alias Plug.Conn.Unfetched
 
   require Logger
-
-  # RFC 7234 §5.2: token responses and errors must never be cached.
-  @cache_control_no_store "no-store"
-  @pragma_no_cache "no-cache"
 
   # RFC 6749 §5.2 / RFC 9449 §5 error codes the framing layer raises before the
   # core runs, held as the atoms `OAuthError.new/3` requires (no string round-trip).
@@ -77,14 +73,12 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # RFC 9449 §4.1: the DPoP proof request header read off the conn and passed
   # to the core as data.
   @dpop_request_header "dpop"
+  @client_attestation_header "oauth-client-attestation"
+  @client_attestation_pop_header "oauth-client-attestation-pop"
 
   # RFC 9449 §4.2: the token endpoint is reached by POST, so the proof's `htm`
   # claim must equal this.
   @http_method_post "POST"
-
-  # RFC 7523 / OIDC Core §9: client assertions are short-lived JWTs whose `jti`
-  # is consumed once by the authorization server.
-  @client_assertion_max_lifetime 300
 
   @doc """
   Token endpoint action (RFC 6749 §3.2).
@@ -96,8 +90,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = resolve_config()
-    conn = put_no_store_headers(conn)
+    config = Config.resolve!()
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_token_content_type(conn),
          :ok <- reject_query_credentials(conn),
@@ -245,7 +239,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
       {:error, %OAuthError{} = err, events} ->
         emit_all(config, events)
-        render_error(conn, err)
+        render_error(conn, config, err)
     end
   end
 
@@ -284,15 +278,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
     end
   end
 
-  # ── Configuration resolution ─────────────────────────────────────────────
-
-  # The validated `%AttestoPhoenix.Config{}` is resolved from the host's
-  # `:otp_app` configuration so the controller holds no policy of its own.
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
-  end
-
   # ── Client authentication (RFC 6749 §2.3) ────────────────────────────────
 
   # RFC 6749 §2.3: client authentication is delegated to the conn-free core
@@ -309,18 +294,16 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # lets a single-profile deployment narrow it. Both values name THIS server, so
   # accepting either does not admit an assertion minted for a different
   # authorization server — the point of the audience restriction. The assertion
-  # lives at most `@client_assertion_max_lifetime` seconds.
+  # lifetime is limited to 300 seconds by the shared endpoint policy.
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: true,
-      assertion_audiences: Config.client_assertion_audiences(config),
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :token)
 
     case ClientAuthentication.authenticate_with_context(
-           get_req_header(conn, "authorization"),
+           %{
+             authorization: get_req_header(conn, "authorization"),
+             oauth_client_attestation: get_req_header(conn, @client_attestation_header),
+             oauth_client_attestation_pop: get_req_header(conn, @client_attestation_pop_header)
+           },
            params,
            config,
            policy
@@ -358,17 +341,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   defp client_auth_challenge(%Config{basic_realm: realm}, scheme) do
     # `:basic_realm` is typed `String.t()` and defaults to "OAuth", so it is
     # always a binary - no nil fallback is needed (and dialyzer flags one as dead).
-    challenge_scheme(scheme) <> ~s( realm="#{escape_auth_param(realm)}")
-  end
-
-  defp challenge_scheme(scheme) do
-    if String.downcase(scheme) == "basic", do: "Basic", else: scheme
-  end
-
-  defp escape_auth_param(value) do
-    value
-    |> String.replace("\\", "\\\\")
-    |> String.replace("\"", "\\\"")
+    OAuthError.format_challenge(scheme, realm: realm)
   end
 
   defp fetch_grant_type(%{"grant_type" => gt}) when is_binary(gt) and gt != "", do: {:ok, gt}
@@ -411,7 +384,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
         |> Map.new()
     })
 
-    render_error(conn, err)
+    render_error(conn, config, err)
   end
 
   defp denial_client_id(_conn, _params, client_id) when is_binary(client_id) and client_id != "", do: client_id
@@ -435,7 +408,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   # ── Rendering (RFC 6749 §5.2) ────────────────────────────────────────────
 
-  defp render_error(conn, %OAuthError{} = err) do
+  defp render_error(conn, config, %OAuthError{} = err) do
     # RFC 6749 §5.2 keeps the wire body terse (a code, an optional description),
     # which makes an opaque `invalid_request` / `invalid_scope` 400 hard to
     # diagnose from the response alone. Surface the resolved code + description in
@@ -448,15 +421,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
         if(err.error_description, do: " — #{err.error_description}", else: "")
     end)
 
-    conn
-    |> merge_resp_headers(err.headers)
-    |> put_status(err.status)
-    |> json(error_body(err.error, err.error_description))
+    OAuthError.render(conn, err, auth_scheme: :from_error_context, config: config)
   end
-
-  # RFC 6749 §5.2 error response body.
-  defp error_body(code, nil), do: %{error: code}
-  defp error_body(code, description), do: %{error: code, error_description: description}
 
   # The single error value the controller raises at the framing edge is an
   # `%AttestoPhoenix.OAuthError{}` (the shape the core and the
@@ -469,11 +435,5 @@ defmodule AttestoPhoenix.Controller.TokenController do
       value when is_binary(value) and value != "" -> value
       _ -> nil
     end
-  end
-
-  defp put_no_store_headers(conn) do
-    conn
-    |> put_resp_header("cache-control", @cache_control_no_store)
-    |> put_resp_header("pragma", @pragma_no_cache)
   end
 end

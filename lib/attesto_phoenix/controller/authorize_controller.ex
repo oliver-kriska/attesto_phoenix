@@ -153,7 +153,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   """
   @spec authorize(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def authorize(conn, params) do
-    config = resolve_config()
+    config = Config.resolve!()
     # Capture the PAR reference before resolution rebinds `params` to the stored
     # set, so it can be consumed once (and only once) a code is issued.
     par_request_uri = params["request_uri"]
@@ -165,6 +165,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
          {:ok, request} <- validate_request(config, client, params, par_resolved?) do
       conn
       |> stash_par_request_uri(par_request_uri, par_resolved?)
+      |> stash_credential_configuration_ids(credential_configuration_ids(config, params))
       |> run_flow(config, client, request, authorize_dpop_jkt(request, params, par_resolved?))
     else
       {:error, :insecure_transport} ->
@@ -346,7 +347,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       not same_origin_required? ->
         :ok
 
-      ClientIdMetadata.loopback_redirect_uri?(redirect_uri) ->
+      # While the port allowance is active, the exemption recognizes the same
+      # explicit host set as the matcher. With the kill switch off, retain the
+      # pre-existing IP-literal exemption for exact callbacks but do not let the
+      # subordinate localhost opt-in affect policy.
+      ClientIdMetadata.loopback_redirect_uri?(redirect_uri, same_origin_loopback_matching(config)) ->
         :ok
 
       ClientIdMetadata.same_origin_redirect_uri?(
@@ -361,6 +366,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp require_same_origin_redirect_uri(_config, _client, _redirect_uri), do: :ok
+
+  defp same_origin_loopback_matching(config) do
+    if Config.native_app_loopback_redirect?(config) do
+      Config.native_app_loopback_matching(config)
+    else
+      :exact_allow_loopback_port
+    end
+  end
 
   defp resolve_request_uri(config, %{"request_uri" => request_uri} = params)
        when is_binary(request_uri) and request_uri != "" do
@@ -632,7 +645,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
             # authorized at this endpoint.
             resource: request.resource,
             family_id: generate_family_id(),
-            claims: code_claims(request, subject)
+            claims: code_claims(conn, request, subject)
           }
           |> put_optional(:dpop_jkt, dpop_jkt)
 
@@ -698,7 +711,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # so the misconfiguration is visible rather than silently dropping the claim.
   # Only the keys the host actually supplied are carried, so the token endpoint
   # can distinguish "absent" from a value.
-  defp code_claims(request, subject) do
+  defp code_claims(conn, request, subject) do
     auth_time = Map.get(subject, :auth_time)
 
     if not is_nil(request.max_age) and is_nil(auth_time) do
@@ -715,7 +728,97 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # code's claims so the token endpoint can stamp `sid` on the ID Token and
     # record a back-channel-logout session for the Relying Party.
     |> put_optional("sid", Map.get(subject, :sid))
+    # OID4VCI (draft-ietf-oauth-openid4vci) §5: the `openid_credential`
+    # authorization_details resolved for this request (stashed onto the conn
+    # by `authorize/2` via `stash_credential_configuration_ids/2`), so the
+    # token endpoint can carry the same `credential_configuration_ids` claim
+    # onto the access token that the pre-authorized_code grant uses (see
+    # `AttestoPhoenix.AuthorizationServer.Token`'s `@grant_pre_authorized_code`
+    # dispatch clause).
+    |> put_optional("credential_configuration_ids", Map.get(conn.private, :attesto_credential_configuration_ids))
   end
+
+  # ── OID4VCI authorization_details (draft-ietf-oauth-openid4vci §5) ───────
+
+  # RFC 9396 §5 `authorization_details`, filtered to `openid_credential`
+  # entries (draft-ietf-oauth-openid4vci §5) naming a
+  # `credential_configuration_id` this issuer actually offers
+  # (`:credential_configurations_supported`). Unconfigured credential
+  # issuance, an absent/malformed parameter, or a named id this issuer does
+  # not offer all resolve to `[]` — none of these fails the (otherwise valid)
+  # authorization request; the wallet simply gets an ordinary access token
+  # with no credential entitlement, exactly as if it had not asked. This is
+  # the SAME entitlement claim the pre-authorized_code grant binds, so the
+  # credential endpoint's entitlement check
+  # (`AttestoPhoenix.Controller.CredentialController.entitled?/2`) works
+  # unchanged regardless of which grant produced the token.
+  #
+  # Read off the (possibly PAR-resolved) `params` map rather than the
+  # validated `%Attesto.AuthorizationRequest{}` struct, which carries no
+  # `authorization_details` field. A request carried as a signed request
+  # object (JAR) is out of scope for this reading: `validate/2` re-merges the
+  # signed object's parameters into the struct, not back onto `params`, so an
+  # `authorization_details` inside a JAR payload is not seen here.
+  defp credential_configuration_ids(config, params) do
+    supported = Config.credential_configurations_supported(config) || %{}
+
+    from_authorization_details =
+      params
+      |> Map.get("authorization_details")
+      |> parse_authorization_details()
+      |> Enum.filter(&openid_credential_entry?/1)
+      |> Enum.flat_map(&entry_credential_configuration_ids/1)
+      |> Enum.filter(&Map.has_key?(supported, &1))
+
+    Enum.uniq(from_authorization_details ++ credential_configuration_ids_from_scope(supported, params))
+  end
+
+  # OID4VCI §5.1.2 / HAIP §4.1: a requested `scope` matching a credential
+  # configuration's advertised `scope` authorizes that configuration - the
+  # scope-based alternative to naming it in `authorization_details`. Both feed
+  # the SAME `credential_configuration_ids` entitlement claim.
+  defp credential_configuration_ids_from_scope(supported, params) do
+    requested = params |> Map.get("scope") |> parse_scope_list()
+
+    for {id, configuration} <- supported,
+        scope = configuration_scope(configuration),
+        scope in requested,
+        do: id
+  end
+
+  defp parse_scope_list(scope) when is_binary(scope), do: String.split(scope, " ", trim: true)
+  defp parse_scope_list(_scope), do: []
+
+  defp configuration_scope(configuration) when is_map(configuration),
+    do: Map.get(configuration, :scope) || Map.get(configuration, "scope")
+
+  defp configuration_scope(_configuration), do: nil
+
+  defp parse_authorization_details(value) when is_binary(value) and value != "" do
+    case JSON.decode(value) do
+      {:ok, list} when is_list(list) -> list
+      _ -> []
+    end
+  end
+
+  defp parse_authorization_details(_value), do: []
+
+  defp openid_credential_entry?(%{"type" => "openid_credential"}), do: true
+  defp openid_credential_entry?(_entry), do: false
+
+  defp entry_credential_configuration_ids(%{"credential_configuration_id" => id}) when is_binary(id) and id != "",
+    do: [id]
+
+  defp entry_credential_configuration_ids(_entry), do: []
+
+  # Stash the resolved credential_configuration_ids (only when non-empty) so
+  # `issue_and_redirect_authorized/5` can read them without threading a new
+  # parameter through the whole authenticate/consent chain — the same idiom
+  # `stash_par_request_uri/3` uses for the PAR reference.
+  defp stash_credential_configuration_ids(conn, []), do: conn
+
+  defp stash_credential_configuration_ids(conn, ids) when is_list(ids),
+    do: Plug.Conn.put_private(conn, :attesto_credential_configuration_ids, ids)
 
   # ── Host callbacks (login / consent) ─────────────────────────────────────
 
@@ -1025,7 +1128,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # through Phoenix content negotiation) so a user agent that arrived without an
   # `Accept` header still receives the error rather than a 406.
   defp render_direct_error(conn, _config, reason) do
-    description = direct_error_description(reason)
+    description = direct_error_description(Callback.map_value(%{reason: reason}, :reason))
     code = direct_error_code(reason)
 
     if accepts_html?(conn) do
@@ -1174,13 +1277,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       result: reason,
       metadata: %{client_ip: RequestContext.client_ip(conn, config)}
     })
-  end
-
-  # ── Configuration resolution ─────────────────────────────────────────────
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
   end
 
   defp config_field(config, key, default) do

@@ -23,17 +23,15 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
   alias AttestoPhoenix.AuthorizationServer.DeviceAuthorization
   alias AttestoPhoenix.AuthorizationServer.DeviceAuthorization.Request
   alias AttestoPhoenix.ClientAuthentication
-  alias AttestoPhoenix.ClientAuthentication.Policy
   alias AttestoPhoenix.{Config, OAuthError, RequestContext}
 
   @dpop_request_header "dpop"
   @http_method_post "POST"
-  @client_assertion_max_lifetime 300
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = resolve_config()
-    conn = put_no_store(conn)
+    config = Config.resolve!()
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),
@@ -42,7 +40,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
          {:ok, response} <- DeviceAuthorization.request(config, build_request(config, conn, result, params)) do
       json(conn, response)
     else
-      {:error, %OAuthError{} = err} -> render_error(conn, err)
+      {:error, %OAuthError{} = err} -> render_error(conn, config, err)
     end
   end
 
@@ -82,13 +80,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
   # may have no secret; the core then REQUIRES such a public client to present a
   # DPoP proof (sender constraint in lieu of a secret).
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: true,
-      assertion_audiences: [config.issuer],
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :device_authorization)
 
     case ClientAuthentication.authenticate_with_context(get_req_header(conn, "authorization"), params, config, policy) do
       {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}
@@ -111,24 +103,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
     }
   end
 
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
-  end
-
-  defp render_error(conn, %OAuthError{} = err) do
-    conn
-    |> merge_resp_headers(err.headers)
-    |> put_status(err.status)
-    |> json(error_body(err))
-  end
-
-  defp error_body(%OAuthError{error: code, error_description: nil}), do: %{error: code}
-  defp error_body(%OAuthError{error: code, error_description: desc}), do: %{error: code, error_description: desc}
-
-  defp put_no_store(conn) do
-    conn
-    |> put_resp_header("cache-control", "no-store")
-    |> put_resp_header("pragma", "no-cache")
+  defp render_error(conn, config, %OAuthError{} = err) do
+    OAuthError.render(conn, err, auth_scheme: :none, config: config)
   end
 end

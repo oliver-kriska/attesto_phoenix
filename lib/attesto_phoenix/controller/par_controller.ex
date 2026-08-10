@@ -20,18 +20,13 @@ defmodule AttestoPhoenix.Controller.PARController do
 
   alias AttestoPhoenix.AuthorizationServer.PAR
   alias AttestoPhoenix.{ClientAuthentication, Config, OAuthError, RequestContext}
-  alias AttestoPhoenix.ClientAuthentication.Policy
 
-  @cache_control_no_store "no-store"
-  @pragma_no_cache "no-cache"
-  @error_invalid_request "invalid_request"
   @dpop_request_header "dpop"
-  @client_assertion_max_lifetime 300
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = resolve_config()
-    conn = put_no_store(conn)
+    config = Config.resolve!()
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- RequestContext.check_https(conn, config),
          {:ok, auth} <- authenticate_client(config, conn, params),
@@ -41,16 +36,11 @@ defmodule AttestoPhoenix.Controller.PARController do
       |> json(stored)
     else
       {:error, :insecure_transport} ->
-        render_error(conn, @error_invalid_request, "TLS required")
+        render_error(conn, config, OAuthError.new(:invalid_request, "TLS required", status: 400))
 
       {:error, %OAuthError{} = err} ->
-        render_error(conn, Atom.to_string(err.error), err.error_description)
+        render_error(conn, config, err)
     end
-  end
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
   end
 
   # RFC 6749 §2.3: client authentication is delegated to the conn-free core
@@ -63,18 +53,19 @@ defmodule AttestoPhoenix.Controller.PARController do
   # Profile §5.3.2.1 / RFC 9126), derived from trusted `Config` (never the
   # request `Host`) - the concrete endpoint URL is NOT accepted as `aud`, so a
   # confused-deputy assertion minted for a different endpoint is rejected. The
-  # assertion lives at most `@client_assertion_max_lifetime` seconds (RFC 7523 §3).
+  # shared endpoint policy limits the assertion to 300 seconds (RFC 7523 §3).
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: false,
-      assertion_audiences: [config.issuer],
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :par)
 
     case ClientAuthentication.authenticate(
-           get_req_header(conn, "authorization"),
+           %{
+             authorization: get_req_header(conn, "authorization"),
+             # attest_jwt_client_auth (HAIP) authenticates the pushed request with
+             # a Wallet Provider attestation carried in these headers, exactly as
+             # at the token endpoint.
+             oauth_client_attestation: get_req_header(conn, "oauth-client-attestation"),
+             oauth_client_attestation_pop: get_req_header(conn, "oauth-client-attestation-pop")
+           },
            params,
            config,
            policy
@@ -105,15 +96,9 @@ defmodule AttestoPhoenix.Controller.PARController do
     }
   end
 
-  defp put_no_store(conn) do
-    conn
-    |> put_resp_header("cache-control", @cache_control_no_store)
-    |> put_resp_header("pragma", @pragma_no_cache)
-  end
-
-  defp render_error(conn, code, desc) do
-    conn
-    |> put_status(:bad_request)
-    |> json(%{error: code, error_description: desc})
+  defp render_error(conn, config, %OAuthError{} = err) do
+    # PAR's existing renderer returns 400 for every failure, including any
+    # future core error that carries a different default status.
+    OAuthError.render(conn, %{err | status: 400}, auth_scheme: :none, config: config)
   end
 end

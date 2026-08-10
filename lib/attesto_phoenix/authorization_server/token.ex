@@ -77,6 +77,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 8628 §3.4: the device authorization grant token request.
   @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
 
+  # OID4VCI §6.1: the pre-authorized code grant token request.
+  @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
+
   # OpenID Connect CIBA Core 1.0 §10.1: the CIBA grant token request.
   @grant_ciba "urn:openid:params:grant-type:ciba"
 
@@ -235,12 +238,19 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              # request-time `resource` — never widened by one. RFC 9470: carry
              # the authentication context (`acr`/`auth_time`) the code recorded
              # at authorize onto the access token for step-up enforcement.
-             audience_opts(audience) ++ auth_context_opts(grant.claims)
+             audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
            ),
          # OIDC Core §3.1.3.3: when the request was an OpenID Connect
          # Authentication Request (granted scope contains `openid`), the token
          # response additionally carries an ID Token.
          {:ok, response} <- maybe_mint_id_token(request, grant, scope, code, response) do
+      # OID4VCI (draft-ietf-oauth-openid4vci) §6.2 / RFC 9396 §7: when the
+      # code carried `openid_credential` credential_configuration_ids
+      # (`access_token_claims/1` already folded them into the minted access
+      # token above), echo the granted `authorization_details` on the token
+      # response. Omitted entirely for a plain authorization_code grant that
+      # carried none — this leaves every non-OID4VCI flow byte-identical.
+      response = maybe_echo_credential_authorization_details(response, grant)
       :ok = record_code_access_token(config, grant, response)
       issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
 
@@ -346,7 +356,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              authorization_grant_id_claims(config, authorization_grant_id),
              # RFC 8707 aud from the bound resource set; RFC 9470 acr/auth_time
              # the verification page recorded onto the approved code.
-             audience_opts(audience) ++ auth_context_opts(grant.claims)
+             audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
            ) do
       issued = token_issued_event(request, scope, "device_code", token_type, binding)
 
@@ -361,6 +371,34 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         grant_type: "device_code",
         family_id: authorization_grant_id
       )
+    end
+  end
+
+  # OID4VCI §6.1: redeem the offer's pre-authorized code and mint the access
+  # token that protects the credential endpoint. This grant is intentionally
+  # available to public clients; the code itself is the wallet's grant
+  # credential. The offer's credential configuration IDs ride in the access
+  # token so the credential endpoint can enforce entitlement.
+  defp dispatch(%Request{grant_type: @grant_pre_authorized_code} = request) do
+    %{config: config, client: client, params: params} = request
+
+    with {:ok, code} <- require_param(params, "pre-authorized_code"),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
+         redemption = redeem_pre_authorized_code(request, code, params),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
+         {:ok, grant} <- redemption,
+         {:ok, scope} <- authorize_scope(config, client, Enum.join(grant.authorized_scopes, " ")),
+         {:ok, response} <-
+           mint(
+             request,
+             grant.subject,
+             scope,
+             token_type,
+             binding,
+             %{"credential_configuration_ids" => grant.credential_configuration_ids},
+             []
+           ) do
+      {:ok, response, [token_issued_event(request, scope, "pre-authorized_code", token_type, binding)]}
     end
   end
 
@@ -743,6 +781,35 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     case DeviceCode.redeem(store, device_code, params, interval: interval) do
       {:ok, grant} -> {:ok, grant}
       {:error, reason} -> {:error, device_grant_error(reason)}
+    end
+  end
+
+  defp redeem_pre_authorized_code(%Request{config: config}, code, params) do
+    case grant_store(config, :pre_authorized_code_store) do
+      store when is_atom(store) and not is_nil(store) ->
+        tx_params =
+          if Map.has_key?(params, "tx_code"),
+            do: %{tx_code: params["tx_code"]},
+            else: %{}
+
+        case Attesto.PreAuthorizedCode.redeem(store, code, tx_params) do
+          {:ok, grant} -> {:ok, grant}
+          {:error, reason} -> {:error, pre_authorized_code_error(reason)}
+        end
+
+      _ ->
+        {:error, error(@error_unsupported_grant_type, "pre-authorized_code grant is not configured")}
+    end
+  end
+
+  defp pre_authorized_code_error(reason) do
+    case Callback.map_value(%{reason: reason}, :reason) do
+      :invalid_grant -> error(@error_invalid_grant, "the pre-authorized code is invalid")
+      :expired -> error(@error_invalid_grant, "the pre-authorized code has expired")
+      :tx_code_required -> error(@error_invalid_grant, "transaction code required")
+      :tx_code_mismatch -> error(@error_invalid_grant, "transaction code mismatch")
+      :tx_code_unexpected -> error(@error_invalid_grant, "transaction code was not expected")
+      _ -> error(@error_invalid_grant, "the pre-authorized code is invalid")
     end
   end
 
@@ -1300,6 +1367,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `:authorize_scope` callback takes the client and the requested scope and
   # returns the granted scope or `{:error, :invalid_scope}` (RFC 6749 §5.2).
   defp authorize_scope(config, client, requested) do
+    # The OID4VCI pre-authorized grant presents its authorized scopes as one
+    # joined value at the dispatch boundary; callbacks retain the established
+    # list-of-scope-values contract.
+    requested = if is_binary(requested), do: String.split(requested, " ", trim: true), else: requested
+
     case invoke(Config.authorize_scope_fun(config), [host_client(client), requested]) do
       {:ok, scope} when is_list(scope) -> {:ok, scope}
       {:error, _reason} -> {:error, error(@error_invalid_scope, "scope not permitted")}
@@ -1479,14 +1551,71 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # UserInfo endpoint can later shape its response. Only the `claims` object is
   # propagated; authentication-context values like nonce/auth_time stay code/ID
   # token state and are not access-token claims.
-  defp access_token_claims(%{claims: claims}) when is_map(claims) do
-    case id_token_claim(claims, "claims") do
-      requested when is_map(requested) -> %{"claims" => requested}
-      _ -> %{}
+  #
+  # OID4VCI (draft-ietf-oauth-openid4vci) §5: when the authorization request
+  # carried `authorization_details` naming `openid_credential` configuration
+  # id(s) this issuer offers, `AttestoPhoenix.Controller.AuthorizeController`
+  # validated and recorded them onto the code's claims. Carry them onto the
+  # access token under the SAME `credential_configuration_ids` claim the
+  # `@grant_pre_authorized_code` dispatch clause below binds, so
+  # `AttestoPhoenix.Controller.CredentialController`'s entitlement check works
+  # unchanged for a wallet that used the ordinary authorization_code flow. A
+  # code that carried none (every non-OID4VCI authorization_code grant) adds
+  # no such claim.
+  defp access_token_claims(grant) do
+    case Callback.map_value(grant, :claims) do
+      claims when is_map(claims) ->
+        %{}
+        |> put_optional("claims", requested_userinfo_claims(claims))
+        |> put_optional("credential_configuration_ids", credential_configuration_ids(claims))
+
+      _ ->
+        %{}
     end
   end
 
-  defp access_token_claims(_grant), do: %{}
+  defp requested_userinfo_claims(claims) do
+    case id_token_claim(claims, "claims") do
+      requested when is_map(requested) -> requested
+      _ -> nil
+    end
+  end
+
+  # The code's claims carry `credential_configuration_ids` as a string-keyed
+  # list (the shape `AttestoPhoenix.Controller.AuthorizeController.code_claims/3`
+  # writes); a non-empty list of ids resolves, anything else (absent,
+  # malformed, empty) resolves to `nil` so `put_optional/2` adds no claim.
+  defp credential_configuration_ids(claims) do
+    case Map.get(claims, "credential_configuration_ids") do
+      [_ | _] = ids -> ids
+      _ -> nil
+    end
+  end
+
+  # OID4VCI §6.2: the token response echoes the `authorization_details` that
+  # were actually granted, each entry naming the `credential_configuration_id`
+  # the resulting access token is entitled to and the `credential_identifiers`
+  # the wallet then presents at the credential endpoint. This issuer maps each
+  # granted configuration to a single credential_identifier equal to its
+  # `credential_configuration_id` (a 1:1 mapping the credential endpoint accepts
+  # verbatim), which the HAIP profile requires to be present.
+  defp maybe_echo_credential_authorization_details(response, grant) do
+    case credential_configuration_ids(grant.claims) do
+      nil ->
+        response
+
+      ids ->
+        Map.put(response, :authorization_details, Enum.map(ids, &credential_authorization_detail/1))
+    end
+  end
+
+  defp credential_authorization_detail(credential_configuration_id) do
+    %{
+      "type" => "openid_credential",
+      "credential_configuration_id" => credential_configuration_id,
+      "credential_identifiers" => [credential_configuration_id]
+    }
+  end
 
   # A configured claim exposes the stable authorization-grant identity already
   # used internally as the refresh-token family id. Authorization-code grants
@@ -1554,29 +1683,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # ── Configuration / protocol-config derivation ───────────────────────────
 
   # The `Attesto.Config` consumed by `Attesto.Token`. Derived from the same
-  # `%AttestoPhoenix.Config{}`; the principal-kind declarations are host policy
-  # carried alongside the config and passed through as the protocol `extra`.
-  defp attesto_config(config) do
-    Config.to_attesto_config(config, principal_kinds_extra(config))
-  end
-
-  # Read the field directly: it is declared `[PrincipalKind.t()] | callback() |
-  # nil`, so the list branch is reachable. (`config_callback/2` narrows its
-  # return to `callback() | nil`, under which the `is_list` guard cannot hold.)
-  defp principal_kinds_extra(%Config{principal_kinds: principal_kinds}) do
-    case principal_kinds do
-      kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
-      callback -> callback |> invoke([]) |> principal_kinds_kw()
-    end
-  end
-
-  defp principal_kinds_kw(kinds) when is_list(kinds) and kinds != [] do
-    [principal_kinds: kinds]
-  end
-
-  defp principal_kinds_kw(_other) do
-    []
-  end
+  # `%AttestoPhoenix.Config{}`; Config resolves the host's principal-kind
+  # policy as part of deriving the protocol config.
+  defp attesto_config(config), do: Config.to_attesto_config(config)
 
   # ── Configured-callback access ───────────────────────────────────────────
 

@@ -46,23 +46,15 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   alias Attesto.Introspection
   alias Attesto.SignedIntrospection
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, OAuthError, RequestContext, ResourceAudiencePolicy}
-  alias AttestoPhoenix.ClientAuthentication.Policy
   # RFC 9701 §4: the media type a caller requests (via Accept) to receive the
   # introspection response as a signed JWT, and the type of that response.
   alias AttestoPhoenix.Store.EctoRefreshStore
 
   @signed_media_type "application/token-introspection+jwt"
 
-  # RFC 7523 §3: the maximum client-assertion lifetime, matching the token
-  # endpoint.
-  @client_assertion_max_lifetime 300
-
   # The Attesto.RefreshStore consulted for opaque refresh tokens, defaulting to
   # the package's Ecto-backed store when the host configures none.
   @default_refresh_store EctoRefreshStore
-
-  @cache_control_no_store "no-store"
-  @pragma_no_cache "no-cache"
 
   # RFC 6749 §5.2 error code, held as the atom `OAuthError.new/3` requires.
   @error_invalid_request :invalid_request
@@ -76,8 +68,8 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) when is_map(params) do
-    config = resolve_config()
-    conn = put_no_store_headers(conn)
+    config = Config.resolve!()
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),
          {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
@@ -85,7 +77,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
          {:ok, token} <- fetch_token(params) do
       respond(conn, config, client_id, token, params)
     else
-      {:error, %OAuthError{} = err} -> render_error(conn, err)
+      {:error, %OAuthError{} = err} -> render_error(conn, config, err)
     end
   end
 
@@ -195,13 +187,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   # derived from trusted Config (never the request Host) - the concrete endpoint
   # URL is not accepted as `aud`.
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: false,
-      assertion_audiences: [config.issuer],
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :introspection)
 
     # Return the full Result; the caller reads the authenticated client_id (the
     # RFC 9701 audience) from it.
@@ -213,28 +199,11 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     )
   end
 
-  defp render_error(conn, %OAuthError{} = err) do
-    conn
-    |> merge_resp_headers(err.headers)
-    |> put_status(err.status)
-    |> json(error_body(err.error, err.error_description))
+  defp render_error(conn, config, %OAuthError{} = err) do
+    OAuthError.render(conn, err, auth_scheme: :none, config: config)
   end
-
-  defp error_body(code, nil), do: %{error: code}
-  defp error_body(code, description), do: %{error: code, error_description: description}
 
   # `code` is a compile-time RFC 6749 §5.2 error-code atom, passed straight to
   # `OAuthError.new/3` (no string-to-atom round-trip that could raise).
   defp error(code, description), do: OAuthError.new(code, description, status: 400)
-
-  defp put_no_store_headers(conn) do
-    conn
-    |> put_resp_header("cache-control", @cache_control_no_store)
-    |> put_resp_header("pragma", @pragma_no_cache)
-  end
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
-  end
 end

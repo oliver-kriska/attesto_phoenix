@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.6.0"
+  @version "2.8.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -71,7 +71,12 @@ defmodule AttestoPhoenix.MixProject do
   # default - including every publish - resolves the published version
   # constraint; local development sets ATTESTO_PATH=1 to use the sibling.
   #
-  # The 1.6.0 floor is load-bearing, not housekeeping. It carries
+  # The 1.9.0 floor is load-bearing, not housekeeping. It carries
+  # `Attesto.RedirectURI`'s
+  # `:exact_allow_loopback_port_including_localhost` mode, which the native-app
+  # policy selects when the host enables `:loopback_include_localhost`. An
+  # older core would compile this package but raise when that mode reaches
+  # `Attesto.RedirectURI.registered?/3`. It also carries
   # `Attesto.DPoP.verify_proof/2`'s `replay_ttl`, which this package's deferred
   # token-endpoint replay claim reads to size the entry it records - against an
   # older core that key is absent and `commit_replay_claim/2` cannot make the
@@ -87,7 +92,7 @@ defmodule AttestoPhoenix.MixProject do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, ">= 1.7.0 and < 2.0.0"}
+      {:attesto, ">= 1.9.0 and < 2.0.0"}
     end
   end
 
@@ -97,6 +102,8 @@ defmodule AttestoPhoenix.MixProject do
       # AuthorizationCode, AuthorizationRequest, RefreshToken, Discovery,
       # OpenIDDiscovery, the store behaviours, and the base plugs.
       attesto_dep(),
+      # ISO 18013-5 mdoc encoding for the mso_mdoc credential issuance path.
+      {:cbor, "~> 1.0", optional: true},
       # Ecto-backed CodeStore/RefreshStore/NonceStore/ReplayCheck + the migration
       # generator.
       {:ecto_sql, "~> 3.10"},

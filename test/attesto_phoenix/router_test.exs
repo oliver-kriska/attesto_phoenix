@@ -18,16 +18,21 @@ defmodule AttestoPhoenix.RouterTest do
   alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
   alias AttestoPhoenix.Controller.EndSessionController
+  alias AttestoPhoenix.Controller.EntityConfigurationController
   alias AttestoPhoenix.Controller.IntrospectionController
   alias AttestoPhoenix.Controller.JWKSController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
   alias AttestoPhoenix.Controller.PARController
+  alias AttestoPhoenix.Controller.PresentationRequestController
+  alias AttestoPhoenix.Controller.PresentationResponseController
   alias AttestoPhoenix.Controller.ProtectedResourceController
   alias AttestoPhoenix.Controller.RegistrationController
   alias AttestoPhoenix.Controller.RevocationController
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
   alias Phoenix.Router.NoRouteError
+
+  @federation_path "/.well-known/openid-federation"
 
   defmodule StubKeystore do
     @moduledoc false
@@ -59,6 +64,15 @@ defmodule AttestoPhoenix.RouterTest do
 
     scope "/" do
       attesto_routes(registration: true)
+    end
+  end
+
+  defmodule FederationRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(prefix: "/auth", federation: true)
     end
   end
 
@@ -294,6 +308,32 @@ defmodule AttestoPhoenix.RouterTest do
 
     scope "/" do
       attesto_routes(logout: true, session_management: true)
+    end
+  end
+
+  defmodule PresentationRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(presentation: true)
+    end
+  end
+
+  defmodule PrefixedPresentationRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    pipeline :wallet_protocol do
+      plug :accepts, ["json"]
+    end
+
+    scope "/" do
+      attesto_routes(
+        prefix: "/verifier",
+        route_pipelines: [protocol: :wallet_protocol],
+        presentation: true
+      )
     end
   end
 
@@ -627,9 +667,44 @@ defmodule AttestoPhoenix.RouterTest do
       refute find_route(DefaultRouter, :delete, "/oauth/register/:client_id")
     end
 
+    test "mounts the root Entity Configuration only when federation is enabled" do
+      refute find_route(DefaultRouter, :get, @federation_path)
+
+      route = find_route(FederationRouter, :get, @federation_path)
+      assert route.plug == EntityConfigurationController
+      assert route.plug_opts == :show
+      refute find_route(FederationRouter, :get, "/auth" <> @federation_path)
+    end
+
     test "mounts registration when enabled" do
       assert find_route(RegistrationRouter, :post, "/oauth/register")
       assert find_route(RegistrationRouter, :delete, "/oauth/register/:client_id")
+    end
+
+    test "mounts presentation routes only when independently enabled" do
+      request_path = "/oauth" <> Config.presentation_request_tail() <> "/:id"
+      response_path = "/oauth" <> Config.presentation_response_tail()
+
+      refute find_route(DefaultRouter, :get, request_path)
+      refute find_route(DefaultRouter, :post, response_path)
+
+      request_route = find_route(PresentationRouter, :get, request_path)
+      response_route = find_route(PresentationRouter, :post, response_path)
+
+      assert request_route.plug == PresentationRequestController
+      assert request_route.plug_opts == :show
+      assert response_route.plug == PresentationResponseController
+      assert response_route.plug_opts == :create
+    end
+
+    test "threads prefix and protocol pipeline through the presentation routes" do
+      request_path = "/verifier/oauth" <> Config.presentation_request_tail() <> "/:id"
+      response_path = "/verifier/oauth" <> Config.presentation_response_tail()
+
+      assert find_route(PrefixedPresentationRouter, :get, request_path)
+      assert find_route(PrefixedPresentationRouter, :post, response_path)
+      assert route_pipeline(PrefixedPresentationRouter, :get, request_path) == [:wallet_protocol]
+      assert route_pipeline(PrefixedPresentationRouter, :post, response_path) == [:wallet_protocol]
     end
 
     test "applies the prefix to the oauth endpoints" do

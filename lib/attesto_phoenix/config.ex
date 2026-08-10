@@ -28,6 +28,15 @@ defmodule AttestoPhoenix.Config do
       signing key and the verification keys published via JWKS. Use a static
       keystore or a host KMS/HSM/Vault-backed implementation; per-key `alg`
       metadata is supported by the core keystore behaviour.
+    * `:vc_keystore` - the keystore used to sign issued Verifiable Credentials;
+      defaults to `:keystore`. Configure a separate EC/ES256 keystore here to
+      issue ES256-signed credentials (e.g. for HAIP) while ID tokens keep their
+      own signing key.
+    * `:verifier_encryption_keystore` - a dedicated EC P-256 keystore used only
+      to advertise and decrypt encrypted OID4VP `direct_post.jwt` responses.
+      It has no fallback to `:keystore`; encrypted-response request creation
+      fails closed when this setting is absent or is not a usable private P-256
+      key.
     * `:repo` - `Ecto.Repo` module used by the Ecto-backed code, refresh,
       nonce, and replay stores.
     * `:load_client` - `(client_id -> {:ok, client} | {:error, :not_found} |
@@ -113,7 +122,8 @@ defmodule AttestoPhoenix.Config do
       that client may target. The same policy governs issuance, introspection,
       and token-exchange subject-token verification.
     * `:native_apps` - RFC 8252 (BCP 212) native-app profile options as
-      `[loopback_redirect: true, reject_embedded_user_agents: false]`.
+      `[loopback_redirect: true, loopback_include_localhost: false,
+      reject_embedded_user_agents: false]`.
 
       The profile as a whole is off until the host classifies a client with
       `:client_native?`, which defaults to `false`. That callback — not
@@ -131,6 +141,22 @@ defmodule AttestoPhoenix.Config do
       exact redirect-URI matching (the OpenID Connect and FAPI profiles do).
       Such a deployment normally has no native clients to begin with, so the
       usual answer is simply not to mark any.
+
+      `:loopback_include_localhost` is an **opt-in**, defaulting to `false`. It
+      widens the §7.3 port allowance to the bare hostname `localhost`, selecting
+      `Attesto.RedirectURI`'s `:exact_allow_loopback_port_including_localhost`
+      mode wherever `:exact_allow_loopback_port` would have been selected. §8.3
+      recommends the IP literal over the name, but its reasons are all about
+      what the *client* binds and how the user's device resolves names - a
+      server refusing the request changes none of them - and real native
+      clients (Claude Code's published metadata document among them) register a
+      portless `http://localhost/callback` and bind an ephemeral port, which no
+      strict deployment can serve at all. The name stays a distinct host
+      identity: `localhost` never cross-matches `127.0.0.1` or `[::1]`, and
+      everything else about the exception keeps its exact-match discipline (see
+      `Attesto.RedirectURI` for the full constraint list). It is subordinate to
+      `:loopback_redirect`: when that kill switch is `false`, this option has
+      no effect.
 
       `:reject_embedded_user_agents` enables the RFC 8252 §8.12 recommendation
       that the authorization endpoint refuse requests made from an in-app
@@ -186,6 +212,38 @@ defmodule AttestoPhoenix.Config do
       list of scopes on the access token; `requested_claims` is the per-claim
       request map from the OpenID Connect `claims` parameter (`%{}` when none).
       Required only when the UserInfo endpoint is mounted.
+    * `:build_credential` - `(subject, credential_configuration_id,
+      holder_jwk -> {:ok, credential} | {:error, reason})`. Produces the
+      format-specific claim material and optional validity window for the
+      OID4VCI Credential endpoint. For SD-JWT VC and JWT VC, the library binds
+      `holder_jwk` as `cnf`; for mdoc, it binds the key as the MSO device key.
+      The library signs the resulting credential. Required when credential
+      issuance is mounted.
+    * `:build_deferred_credential` - `(subject, transaction_id -> {:ok,
+      credential} | {:error, :issuance_pending} | {:error, reason})`.
+      Completes a previously deferred credential (OID4VCI §9) for the
+      Deferred Credential endpoint. The returned credential type and claim
+      values are signed into an SD-JWT VC the same way `:build_credential`'s
+      are, minus holder-key binding (the endpoint carries no fresh proof).
+      `{:error, :issuance_pending}` reports the OID4VCI `issuance_pending`
+      error so the wallet retries later; any other error maps to
+      `invalid_credential_request`. Required only when the Deferred
+      Credential endpoint is used.
+    * `:credential_configurations_supported` - map of OID4VCI credential
+      configuration identifiers to the configuration metadata advertised by
+      the Credential Issuer Metadata endpoint. Required when credential
+      issuance is mounted.
+    * `:federation_authority_hints` - non-empty list of superior OpenID
+      Federation entity identifiers to include in this entity's signed Entity
+      Configuration. Optional; the claim is omitted when unset.
+    * `:federation_entity_metadata` - map of OpenID Federation entity-type
+      identifiers to their metadata. Optional; the claim is omitted from the
+      signed Entity Configuration when unset.
+    * `:status_list_store` - module implementing `Attesto.StatusListStore`,
+      the allocated-index storage for IETF Token Status List (RFC-to-be)
+      credential-status lists. Required when the host mounts the
+      `status_list: true` route; the endpoint answers 404 for a list it
+      cannot resolve through this store.
     * `:build_id_token_claims` - `(client, subject, granted_scopes,
       requested_claims -> claims_map)`. Produces the host claims merged into an
       ID Token (OpenID Connect Core §3.1.3.6 / §5.5 `id_token` member). Distinct
@@ -275,6 +333,17 @@ defmodule AttestoPhoenix.Config do
       advertised/accepted by dynamic client registration and by the token/PAR
       endpoints when configured. When unset, all package-supported methods are
       accepted.
+    * `:trusted_wallet_provider_jwks` - trusted Wallet Provider public keys for
+      `attest_jwt_client_auth`, as an RFC 7517 JWK Set, a single public JWK map,
+      or a list of public JWK maps. The method is disabled and omitted from
+      discovery metadata when this is unset.
+    * `:key_attestation_trusted_jwks` - trusted keys for verifying a
+      `key_attestation` header carried in a credential proof (OID4VCI key
+      attestation), same shapes as `:trusted_wallet_provider_jwks`. When unset,
+      a present `key_attestation` header is not inspected.
+    * `:require_key_attestation` - when `true`, the credential endpoint rejects a
+      proof that carries no `key_attestation` header (HAIP). Only meaningful with
+      `:key_attestation_trusted_jwks`; defaults to `false`.
 
   ### Optional values (with defaults)
 
@@ -450,6 +519,26 @@ defmodule AttestoPhoenix.Config do
       Defaults to the single-node ETS replay cache.
     * `:nonce_store` - `Attesto.DPoP.NonceStore` implementation. Defaults to
       the single-node ETS nonce store.
+    * `:presentation_session_store` - module implementing
+      `Attesto.PresentationSessionStore` for verifier-side OID4VP request state.
+      Required when the host mounts the `presentation: true` routes or calls
+      `AttestoPhoenix.Verifier`.
+    * `:verifier_client_id` - verifier identifier placed in the presentation
+      request and used as the holder Key Binding JWT audience. Required when
+      creating verifier presentation requests with the default or
+      `"redirect_uri"` client-id scheme.
+    * `:verifier_client_id_scheme` - OID4VP verifier client-id scheme. `nil`
+      (the default) and `"redirect_uri"` retain the configured
+      `:verifier_client_id`; `"x509_san_dns"` derives the identifier from
+      `:verifier_dns`.
+    * `:verifier_x5c` - verifier certificate chain as DER binaries, leaf first.
+      Required when `:verifier_client_id_scheme` is `"x509_san_dns"`.
+    * `:verifier_dns` - dNSName advertised by the verifier. Required when
+      `:verifier_client_id_scheme` is `"x509_san_dns"`.
+    * `:presentation_response_mode` - OID4VP response mode advertised to wallets.
+      Defaults to `"direct_post"`; set to `"direct_post.jwt"` to require an
+      encrypted authorization response. That mode also requires a usable
+      `:verifier_encryption_keystore` when a presentation request is created.
     * `:sweep_interval_ms` - interval for `AttestoPhoenix.Store.Sweeper`. The
       sweeper is not started if unset.
     * `:table_prefix` - optional Ecto schema/table prefix for the generated
@@ -550,6 +639,7 @@ defmodule AttestoPhoenix.Config do
   defstruct [
     :issuer,
     :keystore,
+    :vc_keystore,
     :repo,
     :load_client,
     :verify_client_secret,
@@ -564,6 +654,9 @@ defmodule AttestoPhoenix.Config do
     :client_auth_signing_algs,
     :client_auth_enforce_fapi_alg_policy,
     :client_assertion_audiences,
+    :trusted_wallet_provider_jwks,
+    :key_attestation_trusted_jwks,
+    :require_key_attestation,
     :request_object_policy,
     :audience,
     :authorize_scope,
@@ -583,6 +676,8 @@ defmodule AttestoPhoenix.Config do
     :build_principal,
     :authorization_grant_id_claim,
     :build_userinfo_claims,
+    :build_credential,
+    :build_deferred_credential,
     :build_id_token_claims,
     :client_id,
     :client_jwks,
@@ -625,6 +720,19 @@ defmodule AttestoPhoenix.Config do
     :device_authorization_path,
     :device_verification_path,
     :device_code_store,
+    :pre_authorized_code_store,
+    :credential_offer_store,
+    :c_nonce_store,
+    :status_list_store,
+    :presentation_session_store,
+    :verifier_encryption_keystore,
+    :verifier_client_id,
+    :verifier_client_id_scheme,
+    :verifier_x5c,
+    :verifier_dns,
+    :credential_configurations_supported,
+    :federation_authority_hints,
+    :federation_entity_metadata,
     :end_session_path,
     :logout_session_store,
     :terminate_session,
@@ -667,6 +775,7 @@ defmodule AttestoPhoenix.Config do
     ciba_ping_http_client: AttestoPhoenix.CIBAPing.Req,
     logout: [],
     session_management: [],
+    presentation_response_mode: "direct_post",
     basic_realm: "OAuth"
   ]
 
@@ -681,6 +790,7 @@ defmodule AttestoPhoenix.Config do
   @type t :: %__MODULE__{
           issuer: String.t(),
           keystore: module(),
+          vc_keystore: module() | nil,
           repo: module(),
           load_client: callback(),
           verify_client_secret: callback(),
@@ -695,6 +805,9 @@ defmodule AttestoPhoenix.Config do
           client_auth_signing_algs: [String.t()] | nil,
           client_auth_enforce_fapi_alg_policy: boolean() | nil,
           client_assertion_audiences: [String.t()] | (t() -> [String.t()]) | nil,
+          trusted_wallet_provider_jwks: map() | [map()] | nil,
+          key_attestation_trusted_jwks: map() | [map()] | nil,
+          require_key_attestation: boolean() | nil,
           request_object_policy: Policy.t() | nil,
           audience: String.t() | [String.t()] | nil,
           authorize_scope: callback() | nil,
@@ -715,6 +828,8 @@ defmodule AttestoPhoenix.Config do
           build_principal: callback() | nil,
           authorization_grant_id_claim: String.t() | nil,
           build_userinfo_claims: callback() | nil,
+          build_credential: callback() | nil,
+          build_deferred_credential: callback() | nil,
           build_id_token_claims: callback() | nil,
           client_id: callback() | nil,
           client_jwks: callback() | nil,
@@ -775,6 +890,20 @@ defmodule AttestoPhoenix.Config do
           native_apps: keyword(),
           resource_indicators: keyword(),
           device_code_store: module() | nil,
+          pre_authorized_code_store: module() | nil,
+          credential_offer_store: module() | nil,
+          c_nonce_store: module() | nil,
+          status_list_store: module() | nil,
+          presentation_session_store: module() | nil,
+          verifier_encryption_keystore: module() | nil,
+          verifier_client_id: String.t() | nil,
+          verifier_client_id_scheme: String.t() | nil,
+          verifier_x5c: [binary()] | nil,
+          verifier_dns: String.t() | nil,
+          presentation_response_mode: String.t(),
+          credential_configurations_supported: map() | nil,
+          federation_authority_hints: [String.t()] | nil,
+          federation_entity_metadata: map() | nil,
           authenticate_ciba_user: callback() | nil,
           notify_ciba_user: callback() | nil,
           client_ciba_registration: callback() | nil,
@@ -918,7 +1047,16 @@ defmodule AttestoPhoenix.Config do
   #
   # The §8.1 PKCE and §8.4 client-authentication rules take no flag at all: they
   # are restrictions that follow from `:client_native?` alone.
-  @native_apps_defaults [loopback_redirect: true, reject_embedded_user_agents: false]
+  #
+  # `:loopback_include_localhost` is a genuine opt-in too, defaulting to
+  # `false`: §7.3's MUST is scoped to the IP literals, so extending the port
+  # allowance to the `localhost` name is a deliberate interoperability decision
+  # (see `Attesto.RedirectURI`), never a default.
+  @native_apps_defaults [
+    loopback_redirect: true,
+    loopback_include_localhost: false,
+    reject_embedded_user_agents: false
+  ]
 
   defp normalize_native_apps(nil), do: @native_apps_defaults
 
@@ -1055,6 +1193,66 @@ defmodule AttestoPhoenix.Config do
   end
 
   @doc """
+  Resolves the validated config from the library's configured `:otp_app`.
+
+  This is the shared resolution path for controllers that read the global
+  application configuration.
+  """
+  @spec resolve!() :: t()
+  def resolve! do
+    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
+    from_otp_app(otp_app, __MODULE__)
+  end
+
+  @doc "The configured keystore used for ID-token and authorization-server signing."
+  @spec keystore(t()) :: module()
+  def keystore(%__MODULE__{keystore: keystore}), do: keystore
+
+  @doc """
+  The keystore used to sign issued Verifiable Credentials; defaults to
+  `:keystore`. Configure a separate EC/ES256 keystore here to issue
+  ES256-signed credentials (e.g. for HAIP) while ID tokens keep their own
+  signing key.
+  """
+  @spec vc_keystore(t()) :: module()
+  def vc_keystore(%__MODULE__{vc_keystore: nil} = config), do: keystore(config)
+  def vc_keystore(%__MODULE__{vc_keystore: vc_keystore}), do: vc_keystore
+
+  @doc "Returns the PEM used to sign issued Verifiable Credentials."
+  @spec vc_signing_pem(t()) :: String.t()
+  def vc_signing_pem(%__MODULE__{} = config), do: vc_keystore(config).signing_pem()
+
+  @doc """
+  The VC signing key's X.509 certificate chain, or `nil`.
+
+  A list of base64 DER certificate strings stamped as the issued credential's
+  JOSE `x5c` header (HAIP), sourced from the VC keystore's optional `x5c/0`
+  callback. `nil` when the keystore does not provide one.
+  """
+  @spec vc_signing_x5c(t()) :: [String.t()] | nil
+  def vc_signing_x5c(%__MODULE__{} = config) do
+    keystore = vc_keystore(config)
+    if function_exported?(keystore, :x5c, 0), do: keystore.x5c()
+  end
+
+  @doc """
+  Returns the configured Ecto repository, raising when it is unset.
+
+  `missing_message` is available for adapters that have a more specific
+  existing error message; the lookup and default failure stay shared.
+  """
+  @spec ecto_repo!() :: module()
+  def ecto_repo!, do: ecto_repo!("AttestoPhoenix: no :repo configured. Set `config :attesto_phoenix, repo: MyApp.Repo`")
+
+  @spec ecto_repo!(String.t()) :: module()
+  def ecto_repo!(missing_message) when is_binary(missing_message) do
+    case Application.get_env(:attesto_phoenix, :repo) do
+      nil -> raise ArgumentError, missing_message
+      repo -> repo
+    end
+  end
+
+  @doc """
   Returns the merged, defaulted Client ID Metadata Document (CIMD) options.
 
   This is the host's `:client_id_metadata` keyword list merged over the library
@@ -1099,8 +1297,8 @@ defmodule AttestoPhoenix.Config do
 
   @doc """
   Returns the merged, defaulted RFC 8252 native-app profile options, so every
-  recognized member (`:loopback_redirect`, `:reject_embedded_user_agents`) is
-  always present.
+  recognized member (`:loopback_redirect`, `:loopback_include_localhost`,
+  `:reject_embedded_user_agents`) is always present.
   """
   @spec native_apps(t()) :: keyword()
   def native_apps(%__MODULE__{native_apps: opts}), do: opts
@@ -1125,6 +1323,26 @@ defmodule AttestoPhoenix.Config do
     # here through `new/1`, which refuses it at boot; should one arrive on a
     # struct built by hand, it disables the relaxation rather than granting it.
     config |> native_apps() |> Keyword.get(:loopback_redirect, true) == true
+  end
+
+  @doc """
+  The redirect-URI matching mode a loopback-capable client gets: RFC 8252 §7.3
+  port flexibility for the IP literals, widened to the bare `localhost` name
+  iff the host opted in with `native_apps: [loopback_include_localhost: true]`.
+
+  This resolves WHICH loopback mode applies, not WHETHER one does - the caller
+  (`AttestoPhoenix.AuthorizationServer.RequestPolicy.redirect_uri_matching/2`)
+  still gates on the client being native (or a CIMD document declaring a
+  loopback redirect URI) and on `native_app_loopback_redirect?/1`, and resolves
+  `:exact` when either gate refuses.
+  """
+  @spec native_app_loopback_matching(t()) :: Attesto.RedirectURI.matching()
+  def native_app_loopback_matching(%__MODULE__{} = config) do
+    if config |> native_apps() |> Keyword.get(:loopback_include_localhost, false) == true do
+      :exact_allow_loopback_port_including_localhost
+    else
+      :exact_allow_loopback_port
+    end
   end
 
   @doc """
@@ -1220,6 +1438,63 @@ defmodule AttestoPhoenix.Config do
   @doc "The configured `Attesto.DeviceCodeStore` module, or `nil`."
   @spec device_code_store(t()) :: module() | nil
   def device_code_store(%__MODULE__{device_code_store: store}), do: store
+
+  @doc "The configured `Attesto.PreAuthorizedCodeStore` module, or `nil`."
+  @spec pre_authorized_code_store(t()) :: module() | nil
+  def pre_authorized_code_store(%__MODULE__{pre_authorized_code_store: store}), do: store
+
+  @doc "The configured `Attesto.CredentialOfferStore` module, or `nil`."
+  @spec credential_offer_store(t()) :: module() | nil
+  def credential_offer_store(%__MODULE__{credential_offer_store: store}), do: store
+
+  @doc "The configured `Attesto.CNonceStore` module, or `nil`."
+  @spec c_nonce_store(t()) :: module() | nil
+  def c_nonce_store(%__MODULE__{c_nonce_store: store}), do: store
+
+  @doc "The configured `Attesto.StatusListStore` module, or `nil`."
+  @spec status_list_store(t()) :: module() | nil
+  def status_list_store(%__MODULE__{status_list_store: store}), do: store
+
+  @doc "The configured `Attesto.PresentationSessionStore` module, or `nil`."
+  @spec presentation_session_store(t()) :: module() | nil
+  def presentation_session_store(%__MODULE__{presentation_session_store: store}), do: store
+
+  @doc "The dedicated EC P-256 keystore for encrypted OID4VP responses, or `nil`."
+  @spec verifier_encryption_keystore(t()) :: module() | nil
+  def verifier_encryption_keystore(%__MODULE__{verifier_encryption_keystore: keystore}), do: keystore
+
+  @doc "The verifier client identifier used as the OID4VP presentation audience."
+  @spec verifier_client_id(t()) :: String.t() | nil
+  def verifier_client_id(%__MODULE__{verifier_client_id: client_id}), do: client_id
+
+  @doc "The OID4VP verifier client-id scheme, or `nil` for the default behavior."
+  @spec verifier_client_id_scheme(t()) :: String.t() | nil
+  def verifier_client_id_scheme(%__MODULE__{verifier_client_id_scheme: scheme}), do: scheme
+
+  @doc "The verifier certificate chain as DER binaries, leaf first."
+  @spec verifier_x5c(t()) :: [binary()] | nil
+  def verifier_x5c(%__MODULE__{verifier_x5c: x5c}), do: x5c
+
+  @doc "The dNSName advertised by an `x509_san_dns` verifier."
+  @spec verifier_dns(t()) :: String.t() | nil
+  def verifier_dns(%__MODULE__{verifier_dns: dns}), do: dns
+
+  @doc "The OID4VP direct-post response mode advertised to wallets."
+  @spec presentation_response_mode(t()) :: String.t()
+  def presentation_response_mode(%__MODULE__{presentation_response_mode: mode}), do: mode
+
+  @doc "The configured OID4VCI credential-configuration catalog, or `nil`."
+  @spec credential_configurations_supported(t()) :: map() | nil
+  def credential_configurations_supported(%__MODULE__{credential_configurations_supported: configurations}),
+    do: configurations
+
+  @doc "The OpenID Federation superior entity identifiers, or `nil`."
+  @spec federation_authority_hints(t()) :: [String.t()] | nil
+  def federation_authority_hints(%__MODULE__{federation_authority_hints: authority_hints}), do: authority_hints
+
+  @doc "The OpenID Federation entity-type metadata map, or `nil`."
+  @spec federation_entity_metadata(t()) :: map() | nil
+  def federation_entity_metadata(%__MODULE__{federation_entity_metadata: metadata}), do: metadata
 
   @doc """
   The access-token claim name configured for the stable authorization-grant
@@ -1608,9 +1883,10 @@ defmodule AttestoPhoenix.Config do
   this struct by the controllers and plugs, so they are not duplicated into the
   `Attesto.Config`.
 
-  Pass `principal_kinds:` (a non-empty list of `Attesto.PrincipalKind`) and any
-  other `Attesto.Config.new/1` option as `extra` to complete the protocol
-  config; they are merged over the values derived here.
+  The configured `:principal_kinds` list or callback is resolved once for each
+  call. An explicit `extra` value still wins over the derived values. Any other
+  `Attesto.Config.new/1` option may be supplied as `extra`; those options are
+  merged over the values derived here.
   """
   @spec to_attesto_config(t(), keyword()) :: Attesto.Config.t()
   def to_attesto_config(%__MODULE__{} = config, extra \\ []) do
@@ -1633,9 +1909,9 @@ defmodule AttestoPhoenix.Config do
 
   # Resolve the host's `:principal_kinds` (a list or a callback returning one)
   # so to_attesto_config/1 yields a complete Attesto.Config for callers that do
-  # not pass principal_kinds explicitly (e.g. the authorization endpoint signing
-  # JARM responses). An explicit `extra` still wins. Omitted when unresolved so
-  # Attesto.Config.new/1 surfaces the missing required value.
+  # not pass principal_kinds explicitly (e.g. the authorization endpoint
+  # signing JARM responses). An explicit `extra` still wins. Omitted when
+  # unresolved so Attesto.Config.new/1 surfaces the missing required value.
   defp resolved_principal_kinds(%__MODULE__{principal_kinds: principal_kinds}) do
     # Read the field directly: it is declared `[PrincipalKind.t()] | callback() |
     # nil`, so the list branch is reachable. (`config_callback/2` narrows its
@@ -1671,10 +1947,100 @@ defmodule AttestoPhoenix.Config do
   @backchannel_authentication_tail "/bc-authorize"
   @end_session_tail "/end_session"
   @check_session_tail "/check_session"
+  @credential_tail "/credential"
+  @nonce_tail "/nonce"
+  @status_list_tail "/statuslist"
+  @presentation_request_tail "/presentation_request"
+  @presentation_response_tail "/presentation_response"
+  @credential_offer_tail "/credential_offer"
+  @deferred_credential_tail "/deferred_credential"
 
   @doc false
   @spec authorize_tail() :: String.t()
   def authorize_tail, do: @authorize_tail
+
+  @doc false
+  @spec credential_tail() :: String.t()
+  def credential_tail, do: @credential_tail
+
+  @doc false
+  @spec nonce_tail() :: String.t()
+  def nonce_tail, do: @nonce_tail
+
+  @doc false
+  @spec status_list_tail() :: String.t()
+  def status_list_tail, do: @status_list_tail
+
+  @doc false
+  @spec presentation_request_tail() :: String.t()
+  def presentation_request_tail, do: @presentation_request_tail
+
+  @doc false
+  @spec presentation_response_tail() :: String.t()
+  def presentation_response_tail, do: @presentation_response_tail
+
+  @doc false
+  @spec credential_offer_tail() :: String.t()
+  def credential_offer_tail, do: @credential_offer_tail
+
+  @doc false
+  @spec deferred_credential_tail() :: String.t()
+  def deferred_credential_tail, do: @deferred_credential_tail
+
+  @doc "The resolved request path of the OID4VCI credential endpoint."
+  @spec credential_path(t()) :: String.t()
+  def credential_path(%__MODULE__{} = config), do: resolve_path(nil, config, @credential_tail)
+
+  @doc "The resolved request path of the OID4VCI nonce endpoint."
+  @spec nonce_path(t()) :: String.t()
+  def nonce_path(%__MODULE__{} = config), do: resolve_path(nil, config, @nonce_tail)
+
+  @doc "The resolved request path of the Token Status List endpoint."
+  @spec status_list_path(t()) :: String.t()
+  def status_list_path(%__MODULE__{} = config), do: resolve_path(nil, config, @status_list_tail)
+
+  @doc "The resolved request path of the OID4VCI credential-offer endpoint."
+  @spec credential_offer_path(t()) :: String.t()
+  def credential_offer_path(%__MODULE__{} = config), do: resolve_path(nil, config, @credential_offer_tail)
+
+  @doc "The resolved request path of the OID4VCI deferred-credential endpoint."
+  @spec deferred_credential_path(t()) :: String.t()
+  def deferred_credential_path(%__MODULE__{} = config), do: resolve_path(nil, config, @deferred_credential_tail)
+
+  @doc "Absolute URL of the OID4VCI credential endpoint."
+  @spec credential_endpoint_url(t()) :: String.t()
+  def credential_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, credential_path(config))
+
+  @doc "Absolute URL of the OID4VCI nonce endpoint."
+  @spec nonce_endpoint_url(t()) :: String.t()
+  def nonce_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, nonce_path(config))
+
+  @doc "Absolute URL of the Token Status List endpoint."
+  @spec status_list_endpoint_url(t()) :: String.t()
+  def status_list_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, status_list_path(config))
+
+  @doc "Absolute URL of the OID4VCI deferred-credential endpoint."
+  @spec deferred_credential_endpoint_url(t()) :: String.t()
+  def deferred_credential_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, deferred_credential_path(config))
+
+  @doc "The resolved request path of the OID4VP request-object endpoint."
+  @spec presentation_request_path(t()) :: String.t()
+  def presentation_request_path(%__MODULE__{} = config), do: resolve_path(nil, config, @presentation_request_tail)
+
+  @doc "The resolved request path of the OID4VP direct-post response endpoint."
+  @spec presentation_response_path(t()) :: String.t()
+  def presentation_response_path(%__MODULE__{} = config), do: resolve_path(nil, config, @presentation_response_tail)
+
+  @doc "Absolute URL of the OID4VP request-object endpoint."
+  @spec presentation_request_endpoint_url(t()) :: String.t()
+  def presentation_request_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, presentation_request_path(config))
+
+  @doc "Absolute URL of the OID4VP direct-post response endpoint."
+  @spec presentation_response_endpoint_url(t()) :: String.t()
+  def presentation_response_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, presentation_response_path(config))
 
   @doc false
   @spec device_authorization_tail() :: String.t()
@@ -1870,6 +2236,31 @@ defmodule AttestoPhoenix.Config do
   end
 
   @doc """
+  Trusted Wallet Provider keys for attestation-based client authentication.
+
+  Returns an RFC 7517 JWK Set, a single public JWK map, a list of public JWK
+  maps, or `nil` when `attest_jwt_client_auth` is disabled.
+  """
+  @spec trusted_wallet_provider_jwks(t()) :: map() | [map()] | nil
+  def trusted_wallet_provider_jwks(%__MODULE__{trusted_wallet_provider_jwks: jwks}), do: jwks
+
+  @doc """
+  Trusted keys for verifying a `key_attestation` header in a credential proof.
+
+  Returns an RFC 7517 JWK Set, a single public JWK map, a list of public JWK
+  maps, or `nil` when key-attestation verification is disabled.
+  """
+  @spec key_attestation_trusted_jwks(t()) :: map() | [map()] | nil
+  def key_attestation_trusted_jwks(%__MODULE__{key_attestation_trusted_jwks: jwks}), do: jwks
+
+  @doc """
+  Whether a credential proof MUST carry a verified `key_attestation` header.
+  """
+  @spec require_key_attestation?(t()) :: boolean()
+  def require_key_attestation?(%__MODULE__{require_key_attestation: true}), do: true
+  def require_key_attestation?(%__MODULE__{}), do: false
+
+  @doc """
   Absolute URL of the pushed-authorization-request endpoint: the issuer merged
   with `par_path/1`. Advertised as `pushed_authorization_request_endpoint`
   (RFC 9126 §5).
@@ -1918,17 +2309,24 @@ defmodule AttestoPhoenix.Config do
   # is enabled (`jwt_bearer: [enabled: true]`).
   @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
   @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
+  @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
   @grant_ciba "urn:openid:params:grant-type:ciba"
 
   @spec grant_types_supported(t()) :: [String.t()]
   def grant_types_supported(%__MODULE__{grant_types_supported: list} = config) when is_list(list) and list != [],
-    do: list |> maybe_add_jwt_bearer(config) |> maybe_add_device_code(config) |> maybe_add_ciba(config)
+    do:
+      list
+      |> maybe_add_jwt_bearer(config)
+      |> maybe_add_device_code(config)
+      |> maybe_add_pre_authorized_code(config)
+      |> maybe_add_ciba(config)
 
   def grant_types_supported(%__MODULE__{} = config),
     do:
       @default_grant_types_supported
       |> maybe_add_jwt_bearer(config)
       |> maybe_add_device_code(config)
+      |> maybe_add_pre_authorized_code(config)
       |> maybe_add_ciba(config)
 
   defp maybe_add_jwt_bearer(list, %__MODULE__{} = config) do
@@ -1940,6 +2338,12 @@ defmodule AttestoPhoenix.Config do
   defp maybe_add_device_code(list, %__MODULE__{} = config) do
     if device_authorization_enabled?(config) and @grant_device_code not in list,
       do: list ++ [@grant_device_code],
+      else: list
+  end
+
+  defp maybe_add_pre_authorized_code(list, %__MODULE__{} = config) do
+    if pre_authorized_code_store(config) != nil and @grant_pre_authorized_code not in list,
+      do: list ++ [@grant_pre_authorized_code],
       else: list
   end
 
@@ -2178,6 +2582,82 @@ defmodule AttestoPhoenix.Config do
 
       callback ->
         Callback.invoke(callback, [subject, scopes, requested])
+    end
+  end
+
+  @typedoc "The host-provided values used to issue one SD-JWT VC."
+  @type sd_jwt_credential_result :: %{
+          required(:vct) => String.t(),
+          required(:claims) => map(),
+          optional(:valid_from) => integer(),
+          optional(:valid_until) => integer()
+        }
+
+  @typedoc "The host-provided values used to issue one JWT VC."
+  @type jwt_vc_credential_result :: %{
+          required(:credential_type) => String.t(),
+          required(:claims) => map(),
+          optional(:valid_from) => integer(),
+          optional(:valid_until) => integer()
+        }
+
+  @typedoc "The host-provided values used to issue one mdoc credential."
+  @type mdoc_credential_result :: %{
+          required(:namespaces) => %{String.t() => %{String.t() => term()}},
+          optional(:doc_type) => String.t(),
+          optional(:valid_from) => integer(),
+          optional(:valid_until) => integer()
+        }
+
+  @type credential_result :: sd_jwt_credential_result() | jwt_vc_credential_result() | mdoc_credential_result()
+
+  @doc "Returns the configured OID4VCI credential builder callback, or `nil`."
+  @spec build_credential_fun(t()) :: callback() | nil
+  def build_credential_fun(%__MODULE__{} = config), do: Callback.config_callback(config, :build_credential)
+
+  @doc """
+  Invokes the host's `:build_credential` callback for the authenticated subject,
+  requested credential configuration, and holder public JWK.
+
+  Raises `ArgumentError` when the callback is not configured, so a mounted
+  Credential endpoint cannot silently issue an empty credential.
+  """
+  @spec build_credential(t(), String.t(), String.t(), map()) ::
+          {:ok, credential_result()} | {:error, term()}
+  def build_credential(%__MODULE__{} = config, subject, credential_configuration_id, holder_jwk) do
+    case build_credential_fun(config) do
+      nil ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :build_credential is required to serve the Credential endpoint"
+
+      callback ->
+        Callback.invoke(callback, [subject, credential_configuration_id, holder_jwk])
+    end
+  end
+
+  @doc "Returns the configured OID4VCI deferred-credential builder callback, or `nil`."
+  @spec build_deferred_credential_fun(t()) :: callback() | nil
+  def build_deferred_credential_fun(%__MODULE__{} = config),
+    do: Callback.config_callback(config, :build_deferred_credential)
+
+  @doc """
+  Invokes the host's `:build_deferred_credential` callback for the
+  authenticated subject and the transaction id the wallet is polling.
+
+  Raises `ArgumentError` when the callback is not configured, so a Deferred
+  Credential endpoint request cannot silently issue an empty credential.
+  """
+  @spec build_deferred_credential(t(), String.t(), String.t()) ::
+          {:ok, credential_result()} | {:error, :issuance_pending} | {:error, term()}
+  def build_deferred_credential(%__MODULE__{} = config, subject, transaction_id) do
+    case build_deferred_credential_fun(config) do
+      nil ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :build_deferred_credential is required to serve the " <>
+                "Deferred Credential endpoint"
+
+      callback ->
+        Callback.invoke(callback, [subject, transaction_id])
     end
   end
 
@@ -2466,6 +2946,11 @@ defmodule AttestoPhoenix.Config do
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
+    validate_verifier_client_id!(config.verifier_client_id)
+    validate_verifier_client_id_scheme!(config.verifier_client_id_scheme)
+    validate_verifier_x5c!(Callback.config_callback(config, :verifier_x5c))
+    validate_verifier_dns!(config.verifier_dns)
+    validate_presentation_response_mode!(config.presentation_response_mode)
 
     if config.mtls_enabled and is_nil(config.cert_der) do
       raise ArgumentError,
@@ -2521,8 +3006,8 @@ defmodule AttestoPhoenix.Config do
   # incompatible meaning of an OP browser session identifier. A configured
   # grant-id name must not silently shadow any of those values.
   @authorization_grant_id_claim_conflicts ~w(
-    iss aud exp iat jti sub scope typ cnf acr auth_time principal_kind
-    client_id claims sid
+    iss aud exp iat nbf jti sub scope typ cnf acr auth_time principal_kind
+    client_id claims credential_configuration_ids sid
   )
 
   defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: nil}), do: :ok
@@ -2545,11 +3030,11 @@ defmodule AttestoPhoenix.Config do
             "string naming the access-token claim; got #{inspect(claim)}."
   end
 
-  # `:native_apps` carries exactly two members, both booleans, and one of them
+  # `:native_apps` carries exactly three members, all booleans, and one of them
   # (`:loopback_redirect`) is an opt-OUT: it is the switch an operator reaches
   # for to FORBID the RFC 8252 §7.3 relaxation. A silently-ignored value there
   # fails open - the operator believes the relaxation is off while the server
-  # still grants it - so both a non-boolean value and an unrecognized member
+  # still grants it - so a non-boolean value and an unrecognized member
   # (a typo'd `:loopbak_redirect`, say) are refused at boot rather than at the
   # first authorization request.
   #
@@ -2668,7 +3153,9 @@ defmodule AttestoPhoenix.Config do
   # `@bearer_methods`. An empty list, a duplicate, or an unaccepted method (e.g.
   # `"query"`, `"cookie"`) would advertise a contract the resource cannot honour
   # (a conformant client could select a rejected method).
-  defp validate_bearer_methods_supported!(%{bearer_methods_supported: methods}) do
+  defp validate_bearer_methods_supported!(%{} = config) do
+    methods = Callback.config_callback(config, :bearer_methods_supported)
+
     if is_list(methods) and methods != [] and methods == Enum.uniq(methods) and
          Enum.all?(methods, &(&1 in @bearer_methods)) do
       :ok
@@ -3130,4 +3617,55 @@ defmodule AttestoPhoenix.Config do
   # set it must be an absolute path reference.
   defp validate_optional_path!(_key, nil), do: :ok
   defp validate_optional_path!(key, value), do: validate_path!(key, value)
+
+  defp validate_verifier_client_id!(nil), do: :ok
+  defp validate_verifier_client_id!(client_id) when is_binary(client_id) and client_id != "", do: :ok
+
+  defp validate_verifier_client_id!(client_id) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_client_id must be a non-empty string when configured; " <>
+            "got #{inspect(client_id)}"
+  end
+
+  defp validate_verifier_client_id_scheme!(scheme) when scheme in [nil, "redirect_uri", "x509_san_dns"], do: :ok
+
+  defp validate_verifier_client_id_scheme!(scheme) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_client_id_scheme must be nil, \"redirect_uri\", or " <>
+            "\"x509_san_dns\"; got #{inspect(scheme)}"
+  end
+
+  defp validate_verifier_x5c!(nil), do: :ok
+
+  defp validate_verifier_x5c!(x5c) when is_list(x5c) do
+    if Enum.all?(x5c, &(is_binary(&1) and &1 != "")) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :verifier_x5c must be a list of non-empty DER binaries; " <>
+              "got #{inspect(x5c)}"
+    end
+  end
+
+  defp validate_verifier_x5c!(x5c) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_x5c must be a list of non-empty DER binaries; " <>
+            "got #{inspect(x5c)}"
+  end
+
+  defp validate_verifier_dns!(dns) when is_binary(dns) or is_nil(dns), do: :ok
+
+  defp validate_verifier_dns!(dns) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_dns must be a string when configured; " <>
+            "got #{inspect(dns)}"
+  end
+
+  defp validate_presentation_response_mode!(mode) when mode in ["direct_post", "direct_post.jwt"], do: :ok
+
+  defp validate_presentation_response_mode!(mode) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :presentation_response_mode must be \"direct_post\" or " <>
+            "\"direct_post.jwt\"; got #{inspect(mode)}"
+  end
 end
