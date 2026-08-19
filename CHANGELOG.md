@@ -23,6 +23,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `:authorization_grant_id_claim_aliases`, preventing host callbacks or token
   exchange from reintroducing an identifier during rolling renames or after
   active issuance is disabled.
+- Add an opt-in, authorization-code-only `:authorization_code_completion`
+  callback. It runs after single-use code redemption and can wrap principal and
+  JWT construction, access-`jti` recording, generation-0 refresh insertion, and
+  code finalization in one host-owned transaction. Refusal or rollback retains
+  the existing spent-but-unfinalized failure semantics. The default path and
+  every other grant type remain unchanged.
+- Add trusted, bounded authorization-code private context through
+  `:authorization_code_private_context`. A host may capture up to 4 KiB of
+  JSON-compatible state from the authorized client, subject, and new family at
+  issuance and read it only from the completion callback. The state is not
+  accepted from client input, merged into authorization claims, emitted in any
+  token, or inherited by token exchange. Ecto-backed code stores gain an
+  additive nullable `private_context` column; existing Ecto consumers must add
+  it before deploying, while opaque custom/ETS stores require no migration.
 
 ## [2.13.0] - 2026-08-13
 

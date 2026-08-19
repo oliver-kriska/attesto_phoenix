@@ -45,6 +45,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   """
 
   alias Attesto.{AuthorizationCode, DeviceCode, IDToken, RefreshToken, ResourceIndicator, Secret}
+  alias AttestoPhoenix.AuthorizationCodePrivateContext
   alias AttestoPhoenix.AuthorizationServer.JwtBearer
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
@@ -215,7 +216,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, redirect_uri} <- require_param(params, "redirect_uri"),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          :ok <- commit_claim_for_presented_grant(request, :code, code, pending_claim),
-         {:ok, grant} <-
+         {:ok, grant, private_context} <-
            redeem_code(
              request,
              code,
@@ -224,59 +225,17 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              SenderConstraint.binding_jkt(binding)
            ),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
-         {:ok, audience} <- resolve_code_resource(grant, params),
-         {:ok, response} <-
-           mint(
-             request,
-             grant.subject,
-             scope,
-             token_type,
-             binding,
-             Map.merge(
-               access_token_claims(grant),
-               authorization_grant_id_claims(config, grant.family_id)
-             ),
-             # RFC 8707 §2.2: the access token's `aud` is the resource set the
-             # user authorized (bound to the code), optionally narrowed by a
-             # request-time `resource` — never widened by one. RFC 9470: carry
-             # the authentication context (`acr`/`auth_time`) the code recorded
-             # at authorize onto the access token for step-up enforcement.
-             audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
-           ),
-         # OIDC Core §3.1.3.3: when the request was an OpenID Connect
-         # Authentication Request (granted scope contains `openid`), the token
-         # response additionally carries an ID Token.
-         {:ok, response} <- maybe_mint_id_token(request, grant, scope, code, response) do
-      # OID4VCI (draft-ietf-oauth-openid4vci) §6.2 / RFC 9396 §7: when the
-      # code carried `openid_credential` credential_configuration_ids
-      # (`access_token_claims/1` already folded them into the minted access
-      # token above), echo the granted `authorization_details` on the token
-      # response. Omitted entirely for a plain authorization_code grant that
-      # carried none — this leaves every non-OID4VCI flow byte-identical.
-      response = maybe_echo_credential_authorization_details(response, grant)
-      :ok = record_code_access_token(config, grant, response)
-      issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
-
-      # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
-      # client can refresh without re-running the authorization flow. The
-      # initial token is minted into the code's `family_id` (OAuth 2.0 Security
-      # BCP §4.13) so a later replay of the same code, surfaced as
-      # `{:error, {:reuse, meta}}` by `Attesto.AuthorizationCode.redeem/4`,
-      # carries the `family_id` needed to revoke this exact descendant family.
-      #
-      # Only on full success do we finalize the code (record the reuse marker).
-      # `redeem/4` claimed and validated the code but deferred that marker, so a
-      # failure ANYWHERE above (mint, refresh persistence, a host-callback fault)
-      # leaves the code spent-but-unfinalized: the client's retry is a clean
-      # `invalid_grant`, never a false reuse that would revoke the family.
-      case maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued]) do
-        {:ok, response, events} ->
-          :ok = AuthorizationCode.finalize(grant_store(config, :code_store), code, grant)
-          {:ok, response, events}
-
-        {:error, %OAuthError{}} = error ->
-          error
-      end
+         {:ok, audience} <- resolve_code_resource(grant, params) do
+      complete_authorization_code(
+        request,
+        code,
+        grant,
+        private_context,
+        scope,
+        audience,
+        token_type,
+        binding
+      )
     end
   end
 
@@ -529,6 +488,105 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 6749 §5.2.
   defp dispatch(%Request{grant_type: grant_type}) do
     {:error, error(@error_unsupported_grant_type, "unsupported grant_type: #{grant_type}")}
+  end
+
+  # The authorization code is already atomically claimed by `redeem_code/5`.
+  # Everything after that claim runs in one synchronous continuation so a host
+  # may serialize completion with its own subject-revocation transaction. The
+  # default path calls the continuation directly and is byte-for-byte the old
+  # execution order. No code or minted token is included in the callback
+  # context; the closure keeps protocol secrets inside this module.
+  defp complete_authorization_code(request, code, grant, private_context, scope, audience, token_type, binding) do
+    %{config: config} = request
+
+    context = %{
+      client_id: token_client_id(request),
+      subject: grant.subject,
+      family_id: grant.family_id,
+      private_context: private_context
+    }
+
+    continuation = fn ->
+      finish_authorization_code(request, code, grant, scope, audience, token_type, binding)
+    end
+
+    case Config.authorization_code_completion_fun(config) do
+      nil -> continuation.()
+      callback -> callback |> invoke([context, continuation]) |> normalize_authorization_code_completion()
+    end
+  end
+
+  defp finish_authorization_code(request, code, grant, scope, audience, token_type, binding) do
+    %{config: config} = request
+
+    with {:ok, response} <-
+           mint(
+             request,
+             grant.subject,
+             scope,
+             token_type,
+             binding,
+             Map.merge(
+               access_token_claims(grant),
+               authorization_grant_id_claims(config, grant.family_id)
+             ),
+             # RFC 8707 §2.2: the access token's `aud` is the resource set the
+             # user authorized (bound to the code), optionally narrowed by a
+             # request-time `resource` — never widened by one. RFC 9470: carry
+             # the authentication context (`acr`/`auth_time`) the code recorded
+             # at authorize onto the access token for step-up enforcement.
+             audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
+           ),
+         # OIDC Core §3.1.3.3: when the request was an OpenID Connect
+         # Authentication Request (granted scope contains `openid`), the token
+         # response additionally carries an ID Token.
+         {:ok, response} <- maybe_mint_id_token(request, grant, scope, code, response) do
+      # OID4VCI (draft-ietf-oauth-openid4vci) §6.2 / RFC 9396 §7: when the
+      # code carried `openid_credential` credential_configuration_ids
+      # (`access_token_claims/1` already folded them into the minted access
+      # token above), echo the granted `authorization_details` on the token
+      # response. Omitted entirely for a plain authorization_code grant that
+      # carried none — this leaves every non-OID4VCI flow byte-identical.
+      response = maybe_echo_credential_authorization_details(response, grant)
+      :ok = record_code_access_token(config, grant, response)
+      issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
+
+      # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
+      # client can refresh without re-running the authorization flow. The
+      # initial token is minted into the code's `family_id` (OAuth 2.0 Security
+      # BCP §4.13) so a later replay of the same code, surfaced as
+      # `{:error, {:reuse, meta}}` by `Attesto.AuthorizationCode.redeem/4`,
+      # carries the `family_id` needed to revoke this exact descendant family.
+      #
+      # Only on full success do we finalize the code (record the reuse marker).
+      # `redeem/4` claimed and validated the code but deferred that marker, so a
+      # failure ANYWHERE above (mint, refresh persistence, a host-callback fault)
+      # leaves the code spent-but-unfinalized: the client's retry is a clean
+      # `invalid_grant`, never a false reuse that would revoke the family.
+      case maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued]) do
+        {:ok, response, events} ->
+          :ok = AuthorizationCode.finalize(grant_store(config, :code_store), code, grant)
+          {:ok, response, events}
+
+        {:error, %OAuthError{}} = error ->
+          error
+      end
+    end
+  end
+
+  defp normalize_authorization_code_completion({:ok, response, events} = result)
+       when is_map(response) and is_list(events), do: result
+
+  defp normalize_authorization_code_completion({:error, %OAuthError{}} = error), do: error
+
+  defp normalize_authorization_code_completion({:error, _reason}) do
+    Logger.error("authorization code completion callback failed")
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp normalize_authorization_code_completion(_invalid_result) do
+    Logger.error("authorization code completion callback returned an invalid result")
+    {:error, error(@error_invalid_request, "unable to issue token")}
   end
 
   # Validate the ID-JAG and map the handler's reasons to RFC 6749 §5.2 errors: a
@@ -792,9 +850,19 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       |> put_optional(:code_verifier, verifier)
       |> put_optional(:dpop_jkt, jkt)
 
-    case AuthorizationCode.redeem(grant_store(config, :code_store), code, params) do
-      {:ok, grant} ->
-        {:ok, grant}
+    redemption =
+      case Config.authorization_code_completion_fun(config) do
+        nil -> {AuthorizationCode.redeem(grant_store(config, :code_store), code, params), nil}
+        _callback -> AuthorizationCodePrivateContext.redeem(grant_store(config, :code_store), code, params)
+      end
+
+    case redemption do
+      {{:ok, grant}, private_context} when is_map(private_context) or is_nil(private_context) ->
+        {:ok, grant, private_context}
+
+      {{:ok, _grant}, _invalid_private_context} ->
+        Logger.error("authorization code private context is invalid")
+        {:error, grant_error(:invalid_grant)}
 
       # OAuth 2.0 Security BCP §4.13 / RFC 6749 §4.1.2: a re-presented,
       # already-redeemed code is the reuse attack signal. Revoke the
@@ -802,12 +870,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # (`meta.family_id`) before answering - the captured code and any tokens
       # it spawned are now compromised - then fail closed with the generic
       # `invalid_grant` so the replay learns nothing on the wire.
-      {:error, {:reuse, meta}} ->
+      {{:error, {:reuse, meta}}, _private_context} ->
         revoke_reused_family(config, meta)
         revoke_reused_access_tokens(config, meta)
         {:error, grant_error(:invalid_grant)}
 
-      {:error, reason} ->
+      {{:error, reason}, _private_context} ->
         {:error, grant_error(reason)}
     end
   end

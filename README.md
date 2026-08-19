@@ -203,6 +203,10 @@ config :my_app, AttestoPhoenix.Config,
   authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id",
   # Retired names remain reserved while older access tokens are valid.
   authorization_grant_id_claim_aliases: [],
+  # Optional host-private state captured with an authorization code and checked
+  # inside one host-owned completion transaction (see below).
+  authorization_code_private_context: &MyApp.OAuth.capture_code_context/1,
+  authorization_code_completion: &MyApp.OAuth.complete_code/2,
   dpop_enabled: true,
   dpop_nonce_required: false,
   mtls_enabled: false,                 # RFC 8705 certificate-bound tokens
@@ -293,6 +297,68 @@ Choose a collision-resistant claim name under a namespace you control. Do not
 use `sid`: OpenID Connect defines `sid` as the End-User's OP browser-session
 identifier, whose lifecycle is different. Treat the configured claim as
 potentially correlating and expose it only to intended access-token audiences.
+
+### Authorization-code completion transaction
+
+The optional `:authorization_code_completion` callback lets a host serialize
+authorization-code completion with its own subject-revocation policy. Attesto
+redeems the single-use code first, then invokes the callback before principal
+construction or token minting:
+
+```elixir
+def complete_code(context, continuation) do
+  case MyApp.Repo.transaction(fn ->
+         account = MyApp.Accounts.lock_subject!(context.subject)
+
+         if MyApp.Accounts.authorization_allowed?(account, context) do
+           case continuation.() do
+             {:ok, _response, _events} = success -> success
+             {:error, error} -> MyApp.Repo.rollback(error)
+           end
+         else
+           MyApp.Repo.rollback(:subject_revoked)
+         end
+       end) do
+    {:ok, result} -> result
+    {:error, reason} -> {:error, reason}
+  end
+end
+```
+
+The callback receives only `client_id`, `subject`, `family_id`, and
+`private_context`; no authorization code or minted token secret is exposed. Its
+zero-arity continuation synchronously covers principal construction, access-
+and ID-token minting, access-token `jti` recording, optional generation-0
+refresh insertion, and successful code finalization. Run it at most once and do
+not return its successful response until the surrounding transaction commits.
+If a continuation error occurs inside the transaction, roll the transaction
+back rather than committing the error tuple. Redemption deliberately remains
+outside this boundary, so a refusal, rollback, exception, or downstream failure
+leaves the code spent but unfinalized. Refresh rotation and all non-code grants
+bypass this callback. When it is unset, Attesto runs the same completion path
+directly as before.
+
+For host policy that can change while a code is dormant, configure
+`:authorization_code_private_context` together with the completion callback:
+
+```elixir
+def capture_code_context(%{client_id: client_id, subject: subject, family_id: family_id}) do
+  %{
+    "security_epoch" => MyApp.Accounts.security_epoch(subject),
+    "policy" => MyApp.OAuth.policy_version(client_id, family_id)
+  }
+end
+```
+
+The trusted issuance callback sees only the authorized client, subject, and new
+family identifier—not client request parameters. It returns a JSON-compatible
+map or `nil`; Attesto JSON-normalizes the map and rejects encoded values larger
+than 4 KiB. The private state survives code storage/redemption and appears only
+as `context.private_context` at completion. It is separate from authorization
+`claims`, is not inherited by token exchange, and is never emitted in access,
+ID, or refresh tokens. Missing state remains valid, including for codes issued
+before the hook was enabled; hosts that require it for a particular flow must
+fail closed in their completion policy.
 
 ### Resource indicators (RFC 8707)
 
@@ -904,6 +970,27 @@ Then run it:
 ```bash
 mix ecto.migrate
 ```
+
+The generated authorization-code table includes the nullable
+`private_context :map` column used by the optional private-context hook. Existing
+Ecto installations upgrading from 2.13.0 must add it before deploying this
+version, even if the hooks remain disabled, because the current Ecto schema
+selects the column:
+
+```elixir
+alter table(:attesto_authorization_codes) do
+  add :private_context, :map
+end
+```
+
+The additive nullable column is safe for older AttestoPhoenix nodes, but do not
+enable private-context enforcement during a mixed-version rollout: old nodes do
+not capture or expose the value and could complete a code without the new host
+policy. Migrate first, deploy the new version to every authorization and token
+endpoint node, then enable both callbacks. Codes issued before enablement carry
+`nil` and remain redeemable. Custom/ETS code stores need no schema migration,
+provided they honor the `Attesto.CodeStore` contract by round-tripping unknown
+keys in the opaque record `data` map.
 
 ### Clustering
 

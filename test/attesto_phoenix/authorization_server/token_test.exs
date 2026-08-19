@@ -12,6 +12,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   use ExUnit.Case, async: false
 
   alias Attesto.CodeStore.ETS
+  alias AttestoPhoenix.AuthorizationCodePrivateContext
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Config, Event, OAuthError}
@@ -118,7 +119,13 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       }
       |> put_optional_test_value(:family_id, Keyword.get(opts, :family_id))
 
-    {:ok, code} = Attesto.AuthorizationCode.issue(ETS, attrs)
+    {:ok, code} =
+      AuthorizationCodePrivateContext.issue(
+        ETS,
+        attrs,
+        Keyword.get(opts, :private_context),
+        []
+      )
 
     Process.put(:auth_code, code)
     ETS
@@ -591,6 +598,45 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                sender_constraint: :none,
                cnf: nil
              }
+    end
+
+    test "the completion callback is isolated from refresh rotation and unrelated grants" do
+      test_pid = self()
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          client_id: "client-1"
+        })
+
+      config =
+        config(
+          refresh_store: refresh_store,
+          authorization_code_completion: fn _context, _continuation ->
+            send(test_pid, :authorization_code_completion_invoked)
+            {:error, :unexpected_grant}
+          end
+        )
+
+      assert {:ok, %{access_token: access_token}, _events} =
+               Token.issue(config, request(config, params: %{"scope" => "read"}))
+
+      assert is_binary(access_token)
+
+      refresh_request =
+        request(config,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => refresh_token}
+        )
+
+      assert {:ok, %{access_token: refreshed, refresh_token: successor}, _events} =
+               Token.issue(config, refresh_request)
+
+      assert is_binary(refreshed)
+      assert is_binary(successor)
+      refute_received :authorization_code_completion_invoked
     end
   end
 
@@ -1208,18 +1254,31 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "token exchange grant (RFC 8693)" do
-    test "does not inherit the subject token's authorization-grant id" do
+    test "does not inherit the subject authorization's grant id or private context" do
+      test_pid = self()
       family_id = "grant-family-exchange"
-      code_store = start_code_store("oc_user-1", ["read"], family_id: family_id)
+      private_context = %{"mobile_auth_security_epoch" => 42}
+
+      code_store =
+        start_code_store("oc_user-1", ["read"],
+          family_id: family_id,
+          private_context: private_context
+        )
 
       config =
         config(
           code_store: code_store,
-          authorization_grant_id_claim: @authorization_grant_id_claim
+          authorization_grant_id_claim: @authorization_grant_id_claim,
+          authorization_code_completion: fn context, continuation ->
+            send(test_pid, {:authorization_code_completion_invoked, context.private_context})
+            continuation.()
+          end
         )
 
       assert {:ok, subject_response, _events} = Token.issue(config, authorization_code_request(config))
       assert claim!(subject_response.access_token, @authorization_grant_id_claim) == family_id
+      assert_receive {:authorization_code_completion_invoked, ^private_context}
+      refute claim!(subject_response.access_token, "mobile_auth_security_epoch")
 
       exchange_request =
         request(config,
@@ -1233,6 +1292,8 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, exchanged, _events} = Token.issue(config, exchange_request)
       refute claim!(exchanged.access_token, @authorization_grant_id_claim)
+      refute claim!(exchanged.access_token, "mobile_auth_security_epoch")
+      refute_received {:authorization_code_completion_invoked, _context}
     end
 
     test "strips a retired grant-id name after replacement or disablement" do

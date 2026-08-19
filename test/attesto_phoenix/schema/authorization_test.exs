@@ -48,6 +48,16 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       assert Ecto.Changeset.get_change(changeset, :family_id) == "fam-abc"
     end
 
+    test "stores private authorization context separately from token-visible claims" do
+      changeset =
+        base_record(%{attesto_phoenix_private_context: %{"security_epoch" => 42}})
+        |> Authorization.from_record(now: @now)
+
+      assert changeset.valid?
+      assert Ecto.Changeset.get_change(changeset, :private_context) == %{"security_epoch" => 42}
+      assert Ecto.Changeset.get_change(changeset, :claims) == %{"acr" => "phr"}
+    end
+
     test "converts the unix expiry to a utc_datetime column" do
       changeset = Authorization.from_record(base_record(), now: @now)
 
@@ -229,6 +239,41 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
 
       assert record.data.scope == []
       assert record.data.claims == %{}
+    end
+
+    test "round-trips private context under its internal data key" do
+      row = %Authorization{
+        code_hash: "h-private",
+        client_id: "c",
+        subject: "s",
+        scope: [],
+        redirect_uri: "https://rp.example/cb",
+        code_challenge: "chal",
+        code_challenge_method: "S256",
+        claims: %{"nonce" => "visible"},
+        private_context: %{"security_epoch" => 42},
+        expires_at: ~U[2024-01-01 00:01:00Z]
+      }
+
+      record = Authorization.to_record(row)
+
+      assert record.data.attesto_phoenix_private_context == %{"security_epoch" => 42}
+      assert record.data.claims == %{"nonce" => "visible"}
+    end
+
+    test "omits the private data key for legacy and ordinary rows" do
+      row = %Authorization{
+        code_hash: "h-ordinary",
+        client_id: "c",
+        subject: "s",
+        scope: [],
+        redirect_uri: "https://rp.example/cb",
+        claims: %{},
+        private_context: nil,
+        expires_at: ~U[2024-01-01 00:01:00Z]
+      }
+
+      refute Map.has_key?(Authorization.to_record(row).data, :attesto_phoenix_private_context)
     end
   end
 

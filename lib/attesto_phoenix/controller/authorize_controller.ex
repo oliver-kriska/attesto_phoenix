@@ -105,12 +105,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   import Plug.Conn
 
-  alias Attesto.AuthorizationCode
   alias Attesto.AuthorizationRequest
   alias Attesto.JARM
   alias Attesto.ResourceIndicator
   alias Attesto.Secret
   alias Attesto.SessionState
+  alias AttestoPhoenix.AuthorizationCodePrivateContext
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.{BrowserState, Callback, Config, Event, RequestContext}
   alias AttestoPhoenix.ClientIdMetadata
@@ -141,6 +141,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # OIDC Core §3.1.2.1: the two `prompt` values this controller acts on.
   @prompt_none "none"
   @prompt_login "login"
+
+  @max_authorization_code_private_context_bytes 4_096
 
   @doc """
   Authorization endpoint action (RFC 6749 §3.1, OIDC Core §3.1.2).
@@ -632,6 +634,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # each mint a code from one pushed request - exactly one wins the claim.
     case claim_par_request_uri(conn, config) do
       :ok ->
+        family_id = generate_family_id()
+
         attrs =
           %{
             client_id: request.client_id,
@@ -644,16 +648,28 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
             # code so the token endpoint mints `aud` from what the user actually
             # authorized at this endpoint.
             resource: request.resource,
-            family_id: generate_family_id(),
+            family_id: family_id,
             claims: code_claims(conn, request, subject)
           }
           |> put_optional(:dpop_jkt, dpop_jkt)
 
-        case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
-          {:ok, code} ->
-            emit_code_issued(conn, config, request.client_id, request.scope)
-            emit_success(conn, config, request, subject, code)
+        issuance_context = %{
+          client_id: request.client_id,
+          subject: subject_id(subject),
+          family_id: family_id
+        }
 
+        with {:ok, private_context} <- authorization_code_private_context(config, issuance_context),
+             {:ok, code} <-
+               AuthorizationCodePrivateContext.issue(
+                 code_store(config),
+                 attrs,
+                 private_context,
+                 ttl: config.authorization_code_ttl
+               ) do
+          emit_code_issued(conn, config, request.client_id, request.scope)
+          emit_success(conn, config, request, subject, code)
+        else
           {:error, reason} ->
             # Issuance failing on a validated request is a server/config fault,
             # not a client error (RFC 6749 §4.1.2.1 server_error). Do not leak
@@ -679,6 +695,36 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # this id, and code-reuse detection replays it to revoke the descendant
   # family. Generated with the same secret generator the codes themselves use.
   defp generate_family_id, do: Secret.generate()
+
+  defp authorization_code_private_context(config, context) do
+    case Config.authorization_code_private_context_fun(config) do
+      nil ->
+        {:ok, nil}
+
+      callback ->
+        callback
+        |> Callback.invoke([context])
+        |> normalize_authorization_code_private_context()
+    end
+  end
+
+  defp normalize_authorization_code_private_context(nil), do: {:ok, nil}
+
+  defp normalize_authorization_code_private_context(private_context)
+       when is_map(private_context) and not is_struct(private_context) do
+    encoded = JSON.encode!(private_context)
+
+    if byte_size(encoded) <= @max_authorization_code_private_context_bytes do
+      {:ok, JSON.decode!(encoded)}
+    else
+      {:error, :authorization_code_private_context_too_large}
+    end
+  rescue
+    Protocol.UndefinedError -> {:error, :invalid_authorization_code_private_context}
+  end
+
+  defp normalize_authorization_code_private_context(_private_context),
+    do: {:error, :invalid_authorization_code_private_context}
 
   # RFC 9449 §10: the DPoP key thumbprint the issued code is sender-constrained
   # to. Two sources, by path:

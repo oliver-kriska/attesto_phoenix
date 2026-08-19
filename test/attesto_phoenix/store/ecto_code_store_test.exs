@@ -64,6 +64,20 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert data.family_id == "fam-1"
     end
 
+    test "round-trips private context without merging it into claims" do
+      data =
+        grant_data(%{
+          attesto_phoenix_private_context: %{"security_epoch" => 42},
+          claims: %{"nonce" => "visible"}
+        })
+
+      assert :ok = EctoCodeStore.put(entry("hash-private", data))
+      assert {:ok, %{data: stored}} = EctoCodeStore.take("hash-private")
+
+      assert stored.attesto_phoenix_private_context == %{"security_epoch" => 42}
+      assert stored.claims == %{"nonce" => "visible"}
+    end
+
     test "preserves expires_at as absolute unix seconds across storage" do
       assert :ok = EctoCodeStore.put(entry("hash-exp"))
       assert {:ok, %{expires_at: @future_seconds}} = EctoCodeStore.take("hash-exp")

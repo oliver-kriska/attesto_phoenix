@@ -120,6 +120,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       refute source =~ ~s|add :code_challenge_method, :string, size: 16, null: false|
       assert source =~ ~s|add :cnf, :map|
       assert source =~ ~s|add :claims, :map, null: false, default: %{}|
+      assert source =~ ~s|add :private_context, :map|
       assert source =~ ~s|add :consumed_at, :utc_datetime|
       # The schema is @primary_key false, keyed on code_hash: the table is
       # created primary_key: false and there is no surrogate id column in it.
