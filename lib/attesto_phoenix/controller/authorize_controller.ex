@@ -712,19 +712,32 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   defp normalize_authorization_code_private_context(private_context)
        when is_map(private_context) and not is_struct(private_context) do
-    encoded = JSON.encode!(private_context)
+    case encode_authorization_code_private_context(private_context) do
+      {:ok, encoded} when byte_size(encoded) <= @max_authorization_code_private_context_bytes ->
+        case JSON.decode(encoded) do
+          {:ok, normalized} -> {:ok, normalized}
+          {:error, _reason} -> {:error, :invalid_authorization_code_private_context}
+        end
 
-    if byte_size(encoded) <= @max_authorization_code_private_context_bytes do
-      {:ok, JSON.decode!(encoded)}
-    else
-      {:error, :authorization_code_private_context_too_large}
+      {:ok, _encoded} ->
+        {:error, :authorization_code_private_context_too_large}
+
+      {:error, _reason} ->
+        {:error, :invalid_authorization_code_private_context}
     end
-  rescue
-    Protocol.UndefinedError -> {:error, :invalid_authorization_code_private_context}
   end
 
   defp normalize_authorization_code_private_context(_private_context),
     do: {:error, :invalid_authorization_code_private_context}
+
+  # Elixir's built-in JSON module exposes only a raising encoder. Keep that
+  # exception boundary private and collapse every invalid value to one generic
+  # result without inspecting or logging host-private state.
+  defp encode_authorization_code_private_context(private_context) do
+    {:ok, JSON.encode!(private_context)}
+  rescue
+    _exception -> {:error, :invalid_authorization_code_private_context}
+  end
 
   # RFC 9449 §10: the DPoP key thumbprint the issued code is sender-constrained
   # to. Two sources, by path:

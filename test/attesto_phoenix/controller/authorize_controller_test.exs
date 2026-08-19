@@ -282,6 +282,34 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       refute Map.has_key?(location_query(conn), "code")
     end
 
+    test "invalid UTF-8 in private context fails without raising or returning a code" do
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context ->
+          %{"invalid_utf8" => <<255>>}
+        end
+      )
+
+      conn = call(valid_params())
+
+      assert location_query(conn)["error"] == "server_error"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
+    test "a nested non-JSON private-context value fails without raising or returning a code" do
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context ->
+          %{"nested" => %{"value" => {:not, :json}}}
+        end
+      )
+
+      conn = call(valid_params())
+
+      assert location_query(conn)["error"] == "server_error"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
     test "the issued code preserves the OIDC claims request object" do
       claims = %{"userinfo" => %{"name" => %{"essential" => true}}}
       conn = call(valid_params(%{"claims" => JSON.encode!(claims)}))

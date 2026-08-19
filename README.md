@@ -329,14 +329,22 @@ The callback receives only `client_id`, `subject`, `family_id`, and
 `private_context`; no authorization code or minted token secret is exposed. Its
 zero-arity continuation synchronously covers principal construction, access-
 and ID-token minting, access-token `jti` recording, optional generation-0
-refresh insertion, and successful code finalization. Run it at most once and do
-not return its successful response until the surrounding transaction commits.
-If a continuation error occurs inside the transaction, roll the transaction
-back rather than committing the error tuple. Redemption deliberately remains
-outside this boundary, so a refusal, rollback, exception, or downstream failure
-leaves the code spent but unfinalized. Refresh rotation and all non-code grants
-bypass this callback. When it is unset, Attesto runs the same completion path
-directly as before.
+refresh insertion, and successful code finalization. AttestoPhoenix binds it to
+the callback's process and dynamic scope and permits exactly one call: a second,
+cross-process, or escaped call is rejected before it can mint or persist
+anything. Do not return its successful response until the surrounding
+transaction commits. If a continuation error occurs inside the transaction,
+roll the transaction back rather than committing the error tuple. Redemption
+deliberately remains outside this boundary, so a refusal, rollback, exception,
+or downstream failure leaves the code spent but unfinalized. Refresh rotation
+and all non-code grants bypass this callback. When it is unset, Attesto runs the
+same completion path directly as before.
+
+The host transaction can roll back only stores that participate in that same
+transaction (for example, the bundled Ecto code, refresh, and logout-session
+stores using the host Repo). An external API, ETS table, Agent, or custom store
+with an independent transaction is outside this atomicity boundary; do not use
+one for completion writes when all-or-nothing persistence is required.
 
 For host policy that can change while a code is dormant, configure
 `:authorization_code_private_context` together with the completion callback:

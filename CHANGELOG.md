@@ -27,8 +27,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   callback. It runs after single-use code redemption and can wrap principal and
   JWT construction, access-`jti` recording, generation-0 refresh insertion, and
   code finalization in one host-owned transaction. Refusal or rollback retains
-  the existing spent-but-unfinalized failure semantics. The default path and
-  every other grant type remain unchanged.
+  the existing spent-but-unfinalized failure semantics. Its continuation is
+  process-bound, dynamically scoped, and one-shot, so repeated, asynchronous,
+  or escaped calls cannot mint or persist another token set. The default path
+  and every other grant type remain unchanged.
 - Add trusted, bounded authorization-code private context through
   `:authorization_code_private_context`. A host may capture up to 4 KiB of
   JSON-compatible state from the authorized client, subject, and new family at

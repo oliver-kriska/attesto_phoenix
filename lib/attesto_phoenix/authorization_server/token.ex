@@ -506,13 +506,48 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       private_context: private_context
     }
 
-    continuation = fn ->
-      finish_authorization_code(request, code, grant, scope, audience, token_type, binding)
-    end
-
     case Config.authorization_code_completion_fun(config) do
-      nil -> continuation.()
-      callback -> callback |> invoke([context, continuation]) |> normalize_authorization_code_completion()
+      nil ->
+        finish_authorization_code(request, code, grant, scope, audience, token_type, binding)
+
+      callback ->
+        with_authorization_code_continuation(
+          fn -> finish_authorization_code(request, code, grant, scope, audience, token_type, binding) end,
+          fn continuation ->
+            callback
+            |> invoke([context, continuation])
+            |> normalize_authorization_code_completion()
+          end
+        )
+    end
+  end
+
+  # The host wrapper is trusted policy, but continuation cardinality is a
+  # protocol invariant rather than a convention. A unique process-dictionary
+  # key scopes this closure to the callback invocation without starting a
+  # process or publishing global state. The closure checks its owner and live
+  # marker, consumes the marker BEFORE completion, and the outer `after` closes
+  # it on every callback return or exception.
+  defp with_authorization_code_continuation(completion, callback) do
+    owner = self()
+    key = {__MODULE__, :authorization_code_continuation, make_ref()}
+    Process.put(key, :available)
+
+    continuation = fn -> run_authorization_code_continuation(owner, key, completion) end
+
+    try do
+      callback.(continuation)
+    after
+      Process.delete(key)
+    end
+  end
+
+  defp run_authorization_code_continuation(owner, key, completion) do
+    if self() == owner and Process.get(key) == :available do
+      Process.put(key, :consumed)
+      completion.()
+    else
+      {:error, error(@error_invalid_request, "unable to issue token")}
     end
   end
 

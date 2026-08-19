@@ -380,14 +380,19 @@ defmodule AttestoPhoenix.Config do
       code finalization. A host may run it inside its own database transaction
       after locking and revalidating the subject's authorization policy.
 
-      The callback MUST run the continuation synchronously at most once and
-      return its `{:ok, response, events}` or `{:error, oauth_error}` result
-      unchanged. If the continuation returns an error inside a transaction, the
-      callback must roll that transaction back rather than commit the normal
-      error tuple. A callback may decline to continue with `{:error, reason}`;
-      non-OAuth failures are rendered as a generic token-issuance error without
-      logging the reason. Exceptions are not rescued. When unset, the
-      continuation runs directly, preserving existing behavior. This wrapper is
+      AttestoPhoenix binds the continuation to the callback's process and
+      dynamic scope and permits exactly one invocation; a second, cross-process,
+      or escaped invocation is rejected before token minting or persistence. The
+      callback must return the first invocation's `{:ok, response, events}` or
+      `{:error, oauth_error}` result unchanged. If the continuation returns an
+      error inside a transaction, the callback must roll that transaction back
+      rather than commit the normal error tuple. Only stores participating in
+      that same transaction can roll back atomically; external or independently
+      transactional custom stores remain outside this boundary. A callback may
+      decline to continue with `{:error, reason}`; non-OAuth failures are
+      rendered as a generic token-issuance error without logging the reason.
+      Exceptions are not rescued. When unset, the continuation runs directly,
+      preserving existing behavior. This wrapper is
       authorization-code-specific: refresh rotation and every other grant type
       bypass it.
     * `:code_store` - module implementing `Attesto.CodeStore`.

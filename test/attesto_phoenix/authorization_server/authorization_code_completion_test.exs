@@ -18,8 +18,8 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Config, OAuthError, TestRepo}
-  alias AttestoPhoenix.Schema.{Authorization, RefreshToken}
-  alias AttestoPhoenix.Store.{EctoCodeStore, EctoRefreshStore}
+  alias AttestoPhoenix.Schema.{Authorization, LogoutSession, RefreshToken}
+  alias AttestoPhoenix.Store.{EctoCodeStore, EctoLogoutSessionStore, EctoRefreshStore}
   alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag :ecto
@@ -137,9 +137,148 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     end
   end
 
+  defmodule FailingAccessJTIStore do
+    @moduledoc false
+    @behaviour Attesto.CodeStore
+
+    @impl true
+    defdelegate put(record), to: EctoCodeStore
+
+    @impl true
+    defdelegate take(code_hash), to: EctoCodeStore
+
+    @impl true
+    defdelegate get(code_hash), to: EctoCodeStore
+
+    @impl true
+    defdelegate mark_consumed(code_hash, meta), to: EctoCodeStore
+
+    def record_access_token(family_id, _jti, _expires_at) do
+      logout_count = TestRepo.aggregate(LogoutSession, :count)
+      notify({:access_jti_failed, family_id, logout_count})
+      raise "injected access JTI failure"
+    end
+
+    defp notify(step) do
+      if pid = Process.get(:authorization_code_completion_test_pid) do
+        send(pid, {:completion_step, step, Process.get(:authorization_code_completion_active) == true})
+      end
+    end
+  end
+
+  defmodule FailingFinalizationCodeStore do
+    @moduledoc false
+    @behaviour Attesto.CodeStore
+
+    @impl true
+    defdelegate put(record), to: EctoCodeStore
+
+    @impl true
+    defdelegate take(code_hash), to: EctoCodeStore
+
+    @impl true
+    defdelegate get(code_hash), to: EctoCodeStore
+
+    def record_access_token(family_id, jti, expires_at) do
+      EctoCodeStore.record_access_token(family_id, jti, expires_at)
+    end
+
+    @impl true
+    def mark_consumed(code_hash, _meta) do
+      row = TestRepo.get_by!(Authorization, code_hash: code_hash)
+
+      notify({
+        :finalization_failed,
+        is_binary(row.access_token_jti),
+        TestRepo.aggregate(RefreshToken, :count),
+        TestRepo.aggregate(LogoutSession, :count)
+      })
+
+      raise "injected code finalization failure"
+    end
+
+    defp notify(step) do
+      if pid = Process.get(:authorization_code_completion_test_pid) do
+        send(pid, {:completion_step, step, Process.get(:authorization_code_completion_active) == true})
+      end
+    end
+  end
+
+  defmodule AgentCodeStore do
+    @moduledoc false
+    @behaviour Attesto.CodeStore
+
+    def child_spec(_opts) do
+      %{id: __MODULE__, start: {__MODULE__, :start_link, [[]]}}
+    end
+
+    def start_link(_opts), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
+
+    @impl true
+    def put(record) do
+      entry = %{record: record, consumed: false, consumed_success: false, meta: nil, access_token_jti: nil}
+      Agent.update(__MODULE__, &Map.put(&1, record.code_hash, entry))
+      :ok
+    end
+
+    @impl true
+    def get(code_hash) do
+      Agent.get(__MODULE__, fn state ->
+        case Map.get(state, code_hash) do
+          %{consumed: false, record: record} -> {:ok, record}
+          _other -> :error
+        end
+      end)
+    end
+
+    @impl true
+    def take(code_hash) do
+      Agent.get_and_update(__MODULE__, fn state ->
+        case Map.get(state, code_hash) do
+          %{consumed: false, record: record} = entry ->
+            {{:ok, record}, Map.put(state, code_hash, %{entry | consumed: true})}
+
+          %{consumed_success: true, meta: meta} ->
+            {{:error, :consumed, meta}, state}
+
+          _other ->
+            {:error, state}
+        end
+      end)
+    end
+
+    @impl true
+    def mark_consumed(code_hash, meta) do
+      Agent.update(__MODULE__, fn state ->
+        Map.update!(state, code_hash, &%{&1 | consumed_success: true, meta: meta})
+      end)
+
+      :ok
+    end
+
+    def record_access_token(family_id, jti, _expires_at) do
+      Agent.update(__MODULE__, fn state ->
+        Map.new(state, &put_access_token_jti(&1, family_id, jti))
+      end)
+
+      :ok
+    end
+
+    def entry(code) do
+      Agent.get(__MODULE__, &Map.fetch!(&1, Attesto.Secret.hash(code)))
+    end
+
+    defp put_access_token_jti({code_hash, %{record: %{data: %{family_id: family_id}}} = entry}, family_id, jti),
+      do: {code_hash, %{entry | access_token_jti: jti}}
+
+    defp put_access_token_jti(entry, _family_id, _jti), do: entry
+  end
+
   setup do
     owner = Sandbox.start_owner!(TestRepo, sandbox: false)
+    start_supervised!(AgentCodeStore)
 
+    TestRepo.delete_all(LogoutSession)
     TestRepo.delete_all(RefreshToken)
     TestRepo.delete_all(Authorization)
 
@@ -148,6 +287,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
     on_exit(fn ->
       :ok = Sandbox.allow(TestRepo, owner, self())
+      TestRepo.delete_all(LogoutSession)
       TestRepo.delete_all(RefreshToken)
       TestRepo.delete_all(Authorization)
       Sandbox.stop_owner(owner)
@@ -358,6 +498,203 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert_spent_without_completion(family_id)
   end
 
+  test "the continuation is one-shot within the owner process" do
+    family_id = "family-double-call"
+    code = issue_code(family_id)
+    test_pid = self()
+
+    callback = fn _context, continuation ->
+      assert {:error, {:second_call, %OAuthError{} = second_call_error}} =
+               TestRepo.transaction(fn ->
+                 Process.put(:authorization_code_completion_active, true)
+
+                 try do
+                   assert {:ok, _response, _events} = continuation.()
+                   assert {:error, %OAuthError{} = error} = continuation.()
+                   TestRepo.rollback({:second_call, error})
+                 after
+                   Process.delete(:authorization_code_completion_active)
+                 end
+               end)
+
+      {:error, second_call_error}
+    end
+
+    config =
+      config(
+        authorization_code_completion: callback,
+        build_principal: fn client, subject, scope ->
+          send(test_pid, :guarded_build_principal)
+          principal(client, subject, scope)
+        end
+      )
+
+    assert {:error, %OAuthError{error: :invalid_request}, _events} =
+             Token.issue(config, code_request(config, code))
+
+    assert_receive :guarded_build_principal
+    refute_receive :guarded_build_principal
+    assert_receive {:completion_step, {:access_jti, ^family_id, _jti, _expires_at}, true}
+    assert_receive {:completion_step, {:refresh_insert, ^family_id, 0}, true}
+    assert_receive {:completion_step, :code_finalization, true}
+    assert_spent_without_completion(family_id)
+  end
+
+  test "an escaped continuation is closed when the callback returns" do
+    family_id = "family-escaped"
+    code = issue_code(family_id)
+
+    config =
+      config(
+        authorization_code_completion: fn _context, continuation ->
+          send(self(), {:escaped_continuation, continuation})
+          {:error, :host_declined}
+        end,
+        build_principal: fn _client, _subject, _scope ->
+          flunk("an escaped continuation must not build a principal")
+        end
+      )
+
+    capture_log(fn ->
+      assert {:error, %OAuthError{error: :invalid_request}, _events} =
+               Token.issue(config, code_request(config, code))
+    end)
+
+    assert_receive {:escaped_continuation, escaped}
+    assert {:error, %OAuthError{error: :invalid_request}} = escaped.()
+    assert_spent_without_completion(family_id)
+  end
+
+  test "a cross-process continuation invocation is rejected before completion" do
+    family_id = "family-cross-process"
+    code = issue_code(family_id)
+
+    config =
+      config(
+        authorization_code_completion: fn _context, continuation ->
+          Task.async(continuation) |> Task.await()
+        end,
+        build_principal: fn _client, _subject, _scope ->
+          flunk("a cross-process continuation must not build a principal")
+        end
+      )
+
+    assert {:error, %OAuthError{error: :invalid_request}, _events} =
+             Token.issue(config, code_request(config, code))
+
+    assert_spent_without_completion(family_id)
+  end
+
+  test "an invalid callback result is normalized without completion writes" do
+    family_id = "family-invalid-callback-result"
+    code = issue_code(family_id)
+    config = config(authorization_code_completion: fn _context, _continuation -> :invalid_result end)
+
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
+
+    assert log =~ "authorization code completion callback returned an invalid result"
+    refute log =~ "invalid_result"
+    assert_spent_without_completion(family_id)
+  end
+
+  test "callback exceptions propagate and close an escaped continuation" do
+    family_id = "family-callback-exception"
+    code = issue_code(family_id)
+
+    config =
+      config(
+        authorization_code_completion: fn _context, continuation ->
+          send(self(), {:exception_continuation, continuation})
+          raise "injected host callback failure"
+        end
+      )
+
+    assert_raise RuntimeError, "injected host callback failure", fn ->
+      Token.issue(config, code_request(config, code))
+    end
+
+    assert_receive {:exception_continuation, escaped}
+    assert {:error, %OAuthError{error: :invalid_request}} = escaped.()
+    assert_spent_without_completion(family_id)
+  end
+
+  test "a JTI-store exception rolls back an earlier logout-session write" do
+    family_id = "family-jti-failure"
+
+    code =
+      issue_code(family_id, ["openid", "offline_access"],
+        code_store: FailingAccessJTIStore,
+        claims: %{"sid" => "sid-jti-failure"}
+      )
+
+    config = transactional_logout_config(FailingAccessJTIStore)
+
+    assert_raise RuntimeError, "injected access JTI failure", fn ->
+      Token.issue(config, code_request(config, code))
+    end
+
+    assert_receive {:completion_step, {:access_jti_failed, ^family_id, 1}, true}
+    refute_received {:completion_step, {:refresh_insert, ^family_id, 0}, _active}
+    refute_received {:completion_step, :code_finalization, _active}
+    assert_spent_without_completion(family_id)
+  end
+
+  test "a finalization exception rolls back JTI, refresh, and logout-session writes" do
+    family_id = "family-finalization-failure"
+
+    code =
+      issue_code(family_id, ["openid", "offline_access"],
+        code_store: FailingFinalizationCodeStore,
+        claims: %{"sid" => "sid-finalization-failure"}
+      )
+
+    config = transactional_logout_config(FailingFinalizationCodeStore)
+
+    assert_raise RuntimeError, "injected code finalization failure", fn ->
+      Token.issue(config, code_request(config, code))
+    end
+
+    assert_receive {:completion_step, {:refresh_insert, ^family_id, 0}, true}
+    assert_receive {:completion_step, {:finalization_failed, true, 1, 1}, true}
+    assert_spent_without_completion(family_id)
+  end
+
+  test "private context completes end-to-end through a custom Agent code store" do
+    family_id = "family-agent-store"
+    private_context = %{"security_epoch" => 91}
+
+    code =
+      issue_code(family_id, ["read"],
+        code_store: AgentCodeStore,
+        private_context: private_context
+      )
+
+    config =
+      config(
+        code_store: AgentCodeStore,
+        refresh_store: nil,
+        authorization_code_completion: fn context, continuation ->
+          send(self(), {:agent_completion_context, context})
+          continuation.()
+        end
+      )
+
+    assert {:ok, response, _events} = Token.issue(config, code_request(config, code))
+    assert_receive {:agent_completion_context, %{family_id: ^family_id, private_context: ^private_context}}
+    refute claim!(response.access_token, "security_epoch")
+    refute claim!(response.access_token, "private_context")
+
+    entry = AgentCodeStore.entry(code)
+    assert entry.consumed
+    assert entry.consumed_success
+    assert is_binary(entry.access_token_jti)
+    assert entry.record.data.attesto_phoenix_private_context == private_context
+  end
+
   defp config(overrides \\ []) do
     [
       issuer: "https://issuer.example",
@@ -392,10 +729,11 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
   defp issue_code(family_id, scope \\ ["offline_access"], opts \\ []) do
     private_context = Keyword.get(opts, :private_context)
     claims = Keyword.get(opts, :claims, %{})
+    code_store = Keyword.get(opts, :code_store, CompletionCodeStore)
 
     {:ok, code} =
       AuthorizationCodePrivateContext.issue(
-        CompletionCodeStore,
+        code_store,
         %{
           client_id: "client-1",
           redirect_uri: @redirect_uri,
@@ -411,6 +749,17 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       )
 
     code
+  end
+
+  defp transactional_logout_config(code_store) do
+    config(
+      code_store: code_store,
+      authorization_code_completion: transactional_completion(self()),
+      logout: [enabled: true],
+      terminate_session: fn conn, _context -> {:ok, conn} end,
+      logout_session_store: EctoLogoutSessionStore,
+      client_frontchannel_logout_uri: fn _client -> "https://client.example/logout" end
+    )
   end
 
   defp code_request(config, code) do
@@ -477,6 +826,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     refute row.consumed_success
     refute row.access_token_jti
     assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^family_id), :count) == 0
+    assert TestRepo.aggregate(LogoutSession, :count) == 0
   end
 
   defp completion_active?, do: Process.get(:authorization_code_completion_active) == true
