@@ -232,6 +232,15 @@ defmodule AttestoPhoenix.Config do
       controls, for example `"https://api.example/claims/oauth_grant_id"`.
       Do not configure `"sid"`: OIDC defines that as the End-User's OP browser
       session, which is a different lifecycle.
+    * `:authorization_grant_id_claim_aliases` - former or alternate grant-ID
+      claim names that remain protocol-owned while older access tokens are
+      valid. Aliases must be unique and distinct from the active claim. They are
+      never minted; the token endpoint removes them from host principal claims
+      and from tokens produced by token exchange. Keep a retired name here
+      through the maximum lifetime of tokens that used it. This list may remain
+      configured when `:authorization_grant_id_claim` is `nil`, allowing active
+      issuance to stop without letting token exchange re-sign a retired
+      identifier.
     * `:build_userinfo_claims` - `(subject, granted_scopes, requested_claims ->
       claims_map)`. Produces the claim values the UserInfo endpoint
       (OpenID Connect Core §5.3) returns for the authenticated subject. The
@@ -824,7 +833,8 @@ defmodule AttestoPhoenix.Config do
     logout: [],
     session_management: [],
     presentation_response_mode: "direct_post",
-    basic_realm: "OAuth"
+    basic_realm: "OAuth",
+    authorization_grant_id_claim_aliases: []
   ]
 
   # A host callback is an anonymous function, a `{module, function}` pair, or a
@@ -878,6 +888,7 @@ defmodule AttestoPhoenix.Config do
           principal_kinds: [Attesto.PrincipalKind.t()] | callback() | nil,
           build_principal: callback() | nil,
           authorization_grant_id_claim: String.t() | nil,
+          authorization_grant_id_claim_aliases: [String.t()],
           build_userinfo_claims: callback() | nil,
           build_credential: callback() | nil,
           build_deferred_credential: callback() | nil,
@@ -1558,6 +1569,15 @@ defmodule AttestoPhoenix.Config do
   """
   @spec authorization_grant_id_claim(t()) :: String.t() | nil
   def authorization_grant_id_claim(%__MODULE__{authorization_grant_id_claim: claim}), do: claim
+
+  @doc """
+  Former or alternate authorization-grant ID claim names that remain
+  protocol-owned for host-claim and token-exchange stripping.
+
+  These names are never used for new token issuance.
+  """
+  @spec authorization_grant_id_claim_aliases(t()) :: [String.t()]
+  def authorization_grant_id_claim_aliases(%__MODULE__{authorization_grant_id_claim_aliases: aliases}), do: aliases
 
   @doc """
   The RFC 8628 §3.2 verification URI shown to the user: the configured
@@ -2997,6 +3017,7 @@ defmodule AttestoPhoenix.Config do
     validate_resource_metadata!(config)
     validate_resource_metadata_resolver!(config)
     validate_authorization_grant_id_claim!(config)
+    validate_authorization_grant_id_claim_aliases!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
@@ -3077,6 +3098,50 @@ defmodule AttestoPhoenix.Config do
     raise ArgumentError,
           "AttestoPhoenix.Config: :authorization_grant_id_claim must be nil or a non-empty " <>
             "string naming the access-token claim; got #{inspect(claim)}."
+  end
+
+  defp validate_authorization_grant_id_claim_aliases!(%__MODULE__{
+         authorization_grant_id_claim: active_claim,
+         authorization_grant_id_claim_aliases: aliases
+       })
+       when is_list(aliases) do
+    Enum.each(aliases, fn alias_name ->
+      cond do
+        not is_binary(alias_name) or alias_name == "" ->
+          raise ArgumentError,
+                "AttestoPhoenix.Config: every :authorization_grant_id_claim_aliases entry " <>
+                  "must be a non-empty string; got #{inspect(alias_name)}."
+
+        alias_name in @authorization_grant_id_claim_conflicts ->
+          raise ArgumentError,
+                "AttestoPhoenix.Config: :authorization_grant_id_claim_aliases entry " <>
+                  "#{inspect(alias_name)} collides with a protocol- or library-owned claim. " <>
+                  "Configure only collision-resistant claim names under a namespace the host controls."
+
+        true ->
+          :ok
+      end
+    end)
+
+    cond do
+      aliases != Enum.uniq(aliases) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :authorization_grant_id_claim_aliases entries must be unique."
+
+      active_claim in aliases ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :authorization_grant_id_claim_aliases must not include " <>
+                "the active :authorization_grant_id_claim #{inspect(active_claim)}."
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_authorization_grant_id_claim_aliases!(%__MODULE__{authorization_grant_id_claim_aliases: aliases}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :authorization_grant_id_claim_aliases must be a list of " <>
+            "non-empty access-token claim names; got #{inspect(aliases)}."
   end
 
   defp validate_mtls_client_auth!(%__MODULE__{} = config) do

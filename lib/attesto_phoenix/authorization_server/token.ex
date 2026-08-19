@@ -1560,10 +1560,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # `acr` / `auth_time` are reserved: an exchanged (machine-authorized) token
     # must not inherit the subject token's authentication context, which would
     # let token exchange forge a step-up-satisfying token (RFC 9470).
+    # Grant-ID aliases remain reserved independently of the active output name,
+    # so rolling renames and feature disablement cannot re-sign a retired grant
+    # identity from an older subject token.
     reserved =
       MapSet.new(
         ~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++
-          [principal_kind_claim, Config.authorization_grant_id_claim(config)]
+          [principal_kind_claim] ++ authorization_grant_id_claim_names(config)
       )
 
     claims
@@ -1719,14 +1722,19 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # The configured grant-id claim is protocol-owned at this layer. Remove any
-  # value supplied by the host principal builder before merging the grant path's
-  # trusted value. Grant types with no authorization-grant identity therefore
-  # omit the claim instead of letting a host callback fabricate one.
+  defp authorization_grant_id_claim_names(config) do
+    List.wrap(Config.authorization_grant_id_claim(config)) ++
+      Config.authorization_grant_id_claim_aliases(config)
+  end
+
+  # Active and retired grant-id claim names are protocol-owned at this layer.
+  # Remove any value supplied by the host principal builder before merging the
+  # grant path's trusted value. Grant types with no authorization-grant identity
+  # therefore omit these claims instead of letting a host callback fabricate one.
   defp merge_principal_claims(config, principal, extra_claims) do
     case Map.fetch(principal, :claims) do
       {:ok, claims} when is_map(claims) ->
-        claims = claims |> drop_host_grant_id(config) |> Map.merge(extra_claims)
+        claims = claims |> drop_host_grant_ids(config) |> Map.merge(extra_claims)
         Map.put(principal, :claims, claims)
 
       :error ->
@@ -1740,11 +1748,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp drop_host_grant_id(claims, config) do
-    case Config.authorization_grant_id_claim(config) do
-      claim when is_binary(claim) and claim != "" -> Map.delete(claims, claim)
-      _disabled_or_invalid -> claims
-    end
+  defp drop_host_grant_ids(claims, config) do
+    Enum.reduce(authorization_grant_id_claim_names(config), claims, fn claim, claims ->
+      Map.delete(claims, claim)
+    end)
   end
 
   # ── Sender-constraint resolution (RFC 9449 / RFC 8705) ───────────────────

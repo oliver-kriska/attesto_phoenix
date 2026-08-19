@@ -22,6 +22,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   @code_challenge "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
   @redirect_uri "https://client.example/cb"
   @authorization_grant_id_claim "https://api.example/claims/oauth_grant_id"
+  @retired_authorization_grant_id_claim "https://api.example/claims/old_oauth_grant_id"
   @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
   @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
   @subject_token_type_access_token "urn:ietf:params:oauth:token-type:access_token"
@@ -280,6 +281,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       config =
         config(
           authorization_grant_id_claim: @authorization_grant_id_claim,
+          authorization_grant_id_claim_aliases: [@retired_authorization_grant_id_claim],
           build_principal: fn client, subject, scope ->
             %{
               kind: "client",
@@ -287,7 +289,8 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
               scopes: scope,
               claims: %{
                 "client_id" => client.id,
-                @authorization_grant_id_claim => "host-spoof"
+                @authorization_grant_id_claim => "host-spoof",
+                @retired_authorization_grant_id_claim => "retired-host-spoof"
               }
             }
           end
@@ -295,6 +298,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, response, _events} = Token.issue(config, request(config, []))
       refute claim!(response.access_token, @authorization_grant_id_claim)
+      refute claim!(response.access_token, @retired_authorization_grant_id_claim)
     end
 
     test "RFC 8707: an allow-listed resource sets the access token aud to that resource" do
@@ -1229,6 +1233,44 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, exchanged, _events} = Token.issue(config, exchange_request)
       refute claim!(exchanged.access_token, @authorization_grant_id_claim)
+    end
+
+    test "strips a retired grant-id name after replacement or disablement" do
+      family_id = "grant-family-retired-exchange"
+      code_store = start_code_store("oc_user-1", ["read"], family_id: family_id)
+
+      subject_config =
+        config(
+          code_store: code_store,
+          authorization_grant_id_claim: @retired_authorization_grant_id_claim
+        )
+
+      assert {:ok, subject_response, _events} = Token.issue(subject_config, authorization_code_request(subject_config))
+      assert claim!(subject_response.access_token, @retired_authorization_grant_id_claim) == family_id
+
+      exchange_configs = [
+        config(
+          authorization_grant_id_claim: @authorization_grant_id_claim,
+          authorization_grant_id_claim_aliases: [@retired_authorization_grant_id_claim]
+        ),
+        config(authorization_grant_id_claim_aliases: [@retired_authorization_grant_id_claim])
+      ]
+
+      for exchange_config <- exchange_configs do
+        exchange_request =
+          request(exchange_config,
+            grant_type: @grant_token_exchange,
+            params: %{
+              "subject_token" => subject_response.access_token,
+              "subject_token_type" => @subject_token_type_access_token,
+              "scope" => "read"
+            }
+          )
+
+        assert {:ok, exchanged, _events} = Token.issue(exchange_config, exchange_request)
+        refute claim!(exchanged.access_token, @retired_authorization_grant_id_claim)
+        refute claim!(exchanged.access_token, @authorization_grant_id_claim)
+      end
     end
 
     test "strips a configured grant-id key carried only as a subject extra claim" do

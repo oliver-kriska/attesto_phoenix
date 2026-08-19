@@ -19,7 +19,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or override it. The feature is disabled by default, requires no migration,
   and is a correlation handle—not proof that a persisted grant exists or is
   active. An included access-only grant may expose it without creating a
-  persisted refresh family.
+  persisted refresh family. Former names can remain reserved through
+  `:authorization_grant_id_claim_aliases`, preventing host callbacks or token
+  exchange from reintroducing an identifier during rolling renames or after
+  active issuance is disabled.
 
 ## [2.13.0] - 2026-08-13
 

@@ -545,9 +545,22 @@ defmodule AttestoPhoenix.ConfigTest do
   describe ":authorization_grant_id_claim" do
     test "is disabled by default and accepts a host-controlled claim name" do
       assert Config.authorization_grant_id_claim(config()) == nil
+      assert Config.authorization_grant_id_claim_aliases(config()) == []
 
       claim = "https://api.example.com/claims/oauth_grant_id"
       assert Config.authorization_grant_id_claim(config(authorization_grant_id_claim: claim)) == claim
+    end
+
+    test "accepts retired claim aliases independently of active issuance" do
+      aliases = [
+        "https://api.example.com/claims/old_oauth_grant_id",
+        "https://api.example.com/claims/older_oauth_grant_id"
+      ]
+
+      built = config(authorization_grant_id_claim_aliases: aliases)
+
+      assert Config.authorization_grant_id_claim(built) == nil
+      assert Config.authorization_grant_id_claim_aliases(built) == aliases
     end
 
     test "rejects invalid values and every protocol- or library-owned claim name" do
@@ -562,6 +575,27 @@ defmodule AttestoPhoenix.ConfigTest do
       for invalid <- invalid_values ++ reserved_claims do
         assert_raise ArgumentError, ~r/:authorization_grant_id_claim/, fn ->
           config(authorization_grant_id_claim: invalid)
+        end
+      end
+    end
+
+    test "rejects malformed or reserved retired claim aliases" do
+      for invalid <- ["not-a-list", [""], [:grant_id], [123], ["sid"], ["jti"]] do
+        assert_raise ArgumentError, ~r/:authorization_grant_id_claim_aliases/, fn ->
+          config(authorization_grant_id_claim_aliases: invalid)
+        end
+      end
+    end
+
+    test "rejects duplicate aliases and the active claim as an alias" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+
+      for opts <- [
+            [authorization_grant_id_claim_aliases: [claim, claim]],
+            [authorization_grant_id_claim: claim, authorization_grant_id_claim_aliases: [claim]]
+          ] do
+        assert_raise ArgumentError, ~r/:authorization_grant_id_claim_aliases/, fn ->
+          config(opts)
         end
       end
     end

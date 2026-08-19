@@ -201,6 +201,8 @@ config :my_app, AttestoPhoenix.Config,
   authorization_code_ttl: 60,
   # Optional private claim linking access tokens from one authorization grant.
   authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id",
+  # Retired names remain reserved while older access tokens are valid.
+  authorization_grant_id_claim_aliases: [],
   dpop_enabled: true,
   dpop_nonce_required: false,
   mtls_enabled: false,                 # RFC 8705 certificate-bound tokens
@@ -253,9 +255,27 @@ No migration is needed; the feature reuses the existing family storage.
 
 Client credentials, OID4VCI pre-authorized code, token exchange, and ID-JAG
 JWT-bearer grants omit the claim because they do not descend from one of those
-persisted user-authorization lineages. Token exchange also strips the
-configured key from subject-token claims rather than inheriting the subject
-grant's identity.
+persisted user-authorization lineages. Token exchange also strips the active
+claim and every configured alias from subject-token claims rather than
+inheriting the subject grant's identity.
+
+When renaming the claim, keep every former name in
+`:authorization_grant_id_claim_aliases` until access tokens minted under it have
+expired:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id_v2",
+  authorization_grant_id_claim_aliases: [
+    "https://api.example.com/claims/oauth_grant_id"
+  ]
+```
+
+Aliases are never minted. They remain protocol-owned so `:build_principal`
+cannot restore one and token exchange cannot re-sign one during a rolling
+deployment. If active issuance is being disabled, set
+`:authorization_grant_id_claim` to `nil` but retain the aliases for the same
+maximum-token-lifetime window.
 
 This is useful for resource-server sessions such as long-lived Phoenix sockets:
 the resource server can key a session by `{issuer, authorization_grant_id}` and
