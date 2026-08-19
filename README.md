@@ -368,6 +368,13 @@ ID, or refresh tokens. Missing state remains valid, including for codes issued
 before the hook was enabled; hosts that require it for a particular flow must
 fail closed in their completion policy.
 
+The built-in Ecto code store disables application SQL logging and Ecto query
+telemetry for inserts and full-row reads/returns that can carry this private
+state. This prevents it from appearing in query params, cast params, or decoded
+results observed by the application. Custom stores must apply equivalent
+controls. AttestoPhoenix does not control database-server statement or parameter
+logging; configure that separately according to the database's security policy.
+
 ### Resource indicators (RFC 8707)
 
 When one authorization server fronts more than one protected resource (say an
@@ -998,7 +1005,8 @@ policy. Migrate first, deploy the new version to every authorization and token
 endpoint node, then enable both callbacks. Codes issued before enablement carry
 `nil` and remain redeemable. Custom/ETS code stores need no schema migration,
 provided they honor the `Attesto.CodeStore` contract by round-tripping unknown
-keys in the opaque record `data` map.
+keys in the opaque record `data` map. They are also responsible for ensuring
+their own logging and telemetry do not disclose private context.
 
 ### Clustering
 

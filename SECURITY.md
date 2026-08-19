@@ -23,3 +23,13 @@ cna@erlef.org.
 Security fixes are applied to the latest release on
 [Hex](https://hex.pm/packages/attesto_phoenix). Please upgrade to the latest version before
 reporting an issue.
+
+## Authorization-Code Private Context
+
+The built-in Ecto authorization-code store suppresses application SQL logging
+and Ecto query telemetry for operations that insert or return trusted
+authorization-code `private_context`. Other lifecycle operations retain normal
+observability because they neither bind nor return that field. Custom stores
+must provide equivalent protections. This does not disable or configure logging
+inside the database server; database statement and parameter logging remain the
+host operator's responsibility.

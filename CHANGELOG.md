@@ -40,6 +40,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   additive nullable `private_context` column; existing Ecto consumers must add
   it before deploying, while opaque custom/ETS stores require no migration.
 
+### Security
+
+- Suppress application SQL logging and Ecto query telemetry for built-in
+  authorization-code store operations that insert or return private context,
+  preventing disclosure through query params, cast params, or decoded results.
+  Unrelated lifecycle operations retain normal observability. Custom stores and
+  database-server logging remain the host's responsibility.
+
 ## [2.13.0] - 2026-08-13
 
 ### Added

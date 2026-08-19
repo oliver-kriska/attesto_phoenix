@@ -11,7 +11,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
   backend is available (see `test/test_helper.exs`).
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
+
+  import ExUnit.CaptureLog
 
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Store.EctoCodeStore
@@ -164,6 +166,64 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
     end
   end
 
+  describe "private-context query observability" do
+    test "put/1 emits neither query telemetry nor SQL logs" do
+      {private_data, sentinel} = private_grant_data()
+
+      assert_private_query_suppressed(sentinel, fn ->
+        assert :ok = EctoCodeStore.put(entry("hash-private-put", private_data))
+      end)
+
+      assert %Authorization{private_context: %{"nested" => %{"sentinel" => ^sentinel}}} =
+               TestRepo.get_by!(Authorization, code_hash: "hash-private-put")
+    end
+
+    test "get/1 emits neither query telemetry nor SQL logs" do
+      {private_data, sentinel} = private_grant_data()
+      assert :ok = EctoCodeStore.put(entry("hash-private-get", private_data))
+
+      assert_private_query_suppressed(sentinel, fn ->
+        assert {:ok, %{data: %{attesto_phoenix_private_context: private_context}}} =
+                 EctoCodeStore.get("hash-private-get")
+
+        assert private_context == %{"nested" => %{"sentinel" => sentinel}}
+      end)
+    end
+
+    test "a successful take/1 emits neither query telemetry nor SQL logs" do
+      {private_data, sentinel} = private_grant_data()
+      assert :ok = EctoCodeStore.put(entry("hash-private-take", private_data))
+
+      assert_private_query_suppressed(sentinel, fn ->
+        assert {:ok, %{data: %{attesto_phoenix_private_context: private_context}}} =
+                 EctoCodeStore.take("hash-private-take")
+
+        assert private_context == %{"nested" => %{"sentinel" => sentinel}}
+      end)
+    end
+
+    test "a consumed take/1 fallback emits neither query telemetry nor SQL logs" do
+      {private_data, sentinel} = private_grant_data(%{family_id: "fam-private-replay"})
+      assert :ok = EctoCodeStore.put(entry("hash-private-replay", private_data))
+      assert {:ok, _record} = EctoCodeStore.take("hash-private-replay")
+      assert :ok = EctoCodeStore.mark_consumed("hash-private-replay", %{})
+
+      assert_private_query_suppressed(sentinel, fn ->
+        assert {:error, :consumed, %{family_id: "fam-private-replay", subject: "subject-1"}} =
+                 EctoCodeStore.take("hash-private-replay")
+      end)
+    end
+
+    test "operations that cannot carry private context retain query telemetry" do
+      assert :ok = EctoCodeStore.put(entry("hash-telemetry-scope"))
+      assert {:ok, _record} = EctoCodeStore.take("hash-telemetry-scope")
+
+      assert_query_telemetry(fn ->
+        assert :ok = EctoCodeStore.mark_consumed("hash-telemetry-scope", %{})
+      end)
+    end
+  end
+
   describe "access-token revocation after authorization-code reuse" do
     test "records, revokes, and checks the access token issued from a code family" do
       expires_at = System.system_time(:second) + 600
@@ -191,5 +251,71 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
       refute EctoCodeStore.access_token_revoked?("jti-expired")
     end
+  end
+
+  defp private_grant_data(overrides \\ %{}) do
+    sentinel = "private-context-sentinel-#{System.unique_integer([:positive, :monotonic])}"
+
+    data =
+      grant_data(
+        Map.merge(
+          %{attesto_phoenix_private_context: %{"nested" => %{"sentinel" => sentinel}}},
+          overrides
+        )
+      )
+
+    {data, sentinel}
+  end
+
+  defp assert_private_query_suppressed(sentinel, operation) do
+    {handler_id, event_ref} = attach_query_handler()
+
+    try do
+      log = capture_log([level: :debug], operation)
+
+      refute_received {:ecto_code_store_query, ^event_ref}
+
+      if String.contains?(log, sentinel) do
+        flunk("private context appeared in SQL Logger output")
+      end
+
+      if log != "" do
+        flunk("protected EctoCodeStore operation emitted SQL Logger output")
+      end
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp assert_query_telemetry(operation) do
+    {handler_id, event_ref} = attach_query_handler()
+
+    try do
+      operation.()
+      assert_receive {:ecto_code_store_query, ^event_ref}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp attach_query_handler do
+    handler_id = {__MODULE__, make_ref()}
+    event_ref = make_ref()
+    event = Keyword.fetch!(TestRepo.config(), :telemetry_prefix) ++ [:query]
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        &__MODULE__.forward_query_event/4,
+        {self(), event_ref}
+      )
+
+    {handler_id, event_ref}
+  end
+
+  @doc false
+  def forward_query_event(_event, _measurements, _metadata, {test_pid, event_ref}) do
+    send(test_pid, {:ecto_code_store_query, event_ref})
   end
 end

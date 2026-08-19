@@ -27,6 +27,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   the `:attesto_phoenix` app) and is read at call time. A store with no
   backing repository can make no guarantees, so a missing `:repo` fails
   closed rather than silently no-opping.
+
+  Authorization codes may carry host-private completion context. Operations
+  that insert or return the full row disable application SQL logging and Ecto
+  query telemetry per call so params, cast params, and decoded results cannot
+  expose that state. Updates that bind and return no private context retain
+  normal observability. This store cannot control database-server logging.
   """
 
   @behaviour Attesto.CodeStore
@@ -35,6 +41,13 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
+
+  # Authorization rows may carry host-private completion state. Ecto SQL query
+  # telemetry includes params/cast_params and decoded results, so suppress both
+  # application logging and telemetry only for calls that insert or return the
+  # full row. Lifecycle updates below bind and return no private context and
+  # intentionally retain their normal observability.
+  @private_context_query_opts [log: false, telemetry_event: nil]
 
   @doc """
   Persists an authorization-code record keyed by its `:code_hash`.
@@ -58,7 +71,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
       when is_binary(code_hash) and is_map(data) and is_integer(expires_at) do
     record
     |> Authorization.from_record()
-    |> repo().insert!()
+    |> repo().insert!(@private_context_query_opts)
 
     :ok
   end
@@ -91,7 +104,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().update_all(query, set: [consumed_at: consumed_at]) do
+    case repo().update_all(query, [set: [consumed_at: consumed_at]], @private_context_query_opts) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
       {0, _} -> consumed_or_missing(code_hash)
     end
@@ -113,7 +126,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().one(query) do
+    case repo().one(query, @private_context_query_opts) do
       nil -> :error
       row -> {:ok, Authorization.to_record(row)}
     end
@@ -178,7 +191,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   end
 
   defp consumed_or_missing(code_hash) do
-    case repo().get_by(Authorization, code_hash: code_hash) do
+    case repo().get_by(Authorization, [code_hash: code_hash], @private_context_query_opts) do
       %Authorization{consumed_success: true} = row ->
         {:error, :consumed, Authorization.consumed_meta(row)}
 
