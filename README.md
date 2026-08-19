@@ -199,6 +199,8 @@ config :my_app, AttestoPhoenix.Config,
   access_token_ttl: 900,
   refresh_token_ttl: 1_209_600,
   authorization_code_ttl: 60,
+  # Optional private claim linking access tokens from one authorization grant.
+  authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id",
   dpop_enabled: true,
   dpop_nonce_required: false,
   mtls_enabled: false,                 # RFC 8705 certificate-bound tokens
@@ -229,6 +231,48 @@ config = AttestoPhoenix.Config.from_otp_app(:my_app)
 Required keys are validated at build time so misconfiguration fails fast.
 Direct mTLS adapters expose the authenticated certificate through peer data;
 TLS terminators configure `:forwarded_cert_der` plus `:trusted_proxies`.
+
+### Authorization-grant identity
+
+Set `:authorization_grant_id_claim` when a protected resource needs to group
+all access tokens descended from one user authorization independently of both
+the subject and each token's fresh `jti`:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id"
+```
+
+The private claim is off by default. When enabled, the library—not the host's
+`:build_principal` callback—stamps its value from trusted grant state. It is
+present on authorization-code, device-code, and CIBA access tokens and stays
+stable on refreshed access tokens, including a lost-response refresh retry.
+Separate grants remain distinct even when their subject and client are the
+same. Persisted refresh-token records use that same value as their `family_id`.
+No migration is needed; the feature reuses the existing family storage.
+
+Client credentials, OID4VCI pre-authorized code, token exchange, and ID-JAG
+JWT-bearer grants omit the claim because they do not descend from one of those
+persisted user-authorization lineages. Token exchange also strips the
+configured key from subject-token claims rather than inheriting the subject
+grant's identity.
+
+This is useful for resource-server sessions such as long-lived Phoenix sockets:
+the resource server can key a session by `{issuer, authorization_grant_id}` and
+disconnect every socket descended from a grant when that exact grant is
+revoked. The claim is only a signed correlation handle, however. It does not
+prove that a refresh family exists, remains active, or is unrevoked, and it does
+not replace access-token signature, issuer, audience, scope, sender-constraint,
+expiry, or `jti` revocation checks. If host policy declines refresh-token
+issuance, an included access-only grant still gets the correlation claim but no
+refresh family is persisted. Resource servers requiring durable family-state
+enforcement must limit their policy to refresh-capable grants and check that
+state independently.
+
+Choose a collision-resistant claim name under a namespace you control. Do not
+use `sid`: OpenID Connect defines `sid` as the End-User's OP browser-session
+identifier, whose lifecycle is different. Treat the configured claim as
+potentially correlating and expose it only to intended access-token audiences.
 
 ### Resource indicators (RFC 8707)
 

@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-in `:authorization_grant_id_claim` configuration. When enabled,
+  authorization-code, device-code, and CIBA access tokens expose a stable,
+  opaque identifier shared with their persisted refresh-token `family_id` and
+  retained by refresh rotation and lost-response retry while every access token
+  keeps a fresh `jti`. Separate grants remain distinct. Client credentials,
+  OID4VCI pre-authorized code, token exchange, and ID-JAG JWT-bearer grants omit
+  it; token exchange explicitly strips the subject token's identifier. The
+  protocol layer owns the configured claim, so `:build_principal` cannot forge
+  or override it. The feature is disabled by default, requires no migration,
+  and is a correlation handle—not proof that a persisted grant exists or is
+  active. An included access-only grant may expose it without creating a
+  persisted refresh family.
+
 ## [2.13.0] - 2026-08-13
 
 ### Added
