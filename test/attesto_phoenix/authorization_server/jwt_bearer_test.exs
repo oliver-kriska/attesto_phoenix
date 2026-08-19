@@ -17,6 +17,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
   @as_issuer "https://issuer.example"
   @idp "https://idp.example"
   @cid "client-1"
+  @authorization_grant_id_claim "https://api.example/claims/oauth_grant_id"
 
   @signing_pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
   # The IdP's signing key (fixed for the suite).
@@ -184,6 +185,11 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
     claims["aud"]
   end
 
+  defp access_token_claim(config, %{access_token: token}, key) do
+    {:ok, claims} = Attesto.Token.peek_signed_claims(Config.to_attesto_config(config), token)
+    claims[key]
+  end
+
   describe "happy path" do
     test "a valid assertion issues an access token" do
       config = config()
@@ -193,6 +199,27 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert response.token_type == "Bearer"
       assert event.name == :token_issued
       assert event.grant_type == @grant
+    end
+
+    test "does not issue or accept a host-fabricated authorization-grant id" do
+      config =
+        config(
+          authorization_grant_id_claim: @authorization_grant_id_claim,
+          build_principal: fn client, subject, scope ->
+            %{
+              kind: "user",
+              sub: ensure_sub(subject),
+              scopes: scope,
+              claims: %{
+                "client_id" => client.id,
+                @authorization_grant_id_claim => "host-spoof"
+              }
+            }
+          end
+        )
+
+      assert {:ok, response, _events} = issue(config, %{"assertion" => assertion()})
+      refute access_token_claim(config, response, @authorization_grant_id_claim)
     end
 
     test "the assertion scope claim is the granted-scope ceiling" do

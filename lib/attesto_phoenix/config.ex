@@ -212,6 +212,26 @@ defmodule AttestoPhoenix.Config do
       The protocol layer injects the authenticated OAuth `client_id` claim
       required by RFC 9068; the callback may omit it or return the same value,
       but a conflicting value fails issuance.
+    * `:authorization_grant_id_claim` - optional access-token claim name for a
+      stable, opaque identifier of the authorization grant. When configured,
+      authorization-code, device-code, and CIBA access tokens—and refreshed
+      access tokens descended from them—carry the same identifier; persisted
+      refresh-token records use it as their `family_id`. Separate grants remain
+      distinct even for the same subject and client. Client credentials,
+      OID4VCI pre-authorized code, token exchange, and ID-JAG JWT-bearer grants
+      omit it, and token exchange does not inherit the subject token's value.
+      This is useful for grant-scoped resource-server sessions and revocation.
+      If policy declines refresh-token issuance, the access-token claim still
+      identifies the grant, but no persisted refresh family exists to query or
+      revoke. The signed identifier is correlation only: it does not prove that
+      the grant is active or that persisted authority exists. A resource server
+      that requires family-state enforcement must limit the feature to
+      refresh-capable grants and check durable state independently.
+      It is off by default because it adds a correlation handle to access
+      tokens. Use a collision-resistant claim name under a namespace the host
+      controls, for example `"https://api.example/claims/oauth_grant_id"`.
+      Do not configure `"sid"`: OIDC defines that as the End-User's OP browser
+      session, which is a different lifecycle.
     * `:build_userinfo_claims` - `(subject, granted_scopes, requested_claims ->
       claims_map)`. Produces the claim values the UserInfo endpoint
       (OpenID Connect Core §5.3) returns for the authenticated subject. The
@@ -701,6 +721,7 @@ defmodule AttestoPhoenix.Config do
     :introspection_authorize,
     :principal_kinds,
     :build_principal,
+    :authorization_grant_id_claim,
     :build_userinfo_claims,
     :build_credential,
     :build_deferred_credential,
@@ -856,6 +877,7 @@ defmodule AttestoPhoenix.Config do
           introspection_authorize: callback() | nil,
           principal_kinds: [Attesto.PrincipalKind.t()] | callback() | nil,
           build_principal: callback() | nil,
+          authorization_grant_id_claim: String.t() | nil,
           build_userinfo_claims: callback() | nil,
           build_credential: callback() | nil,
           build_deferred_credential: callback() | nil,
@@ -1526,6 +1548,16 @@ defmodule AttestoPhoenix.Config do
   @doc "The OpenID Federation entity-type metadata map, or `nil`."
   @spec federation_entity_metadata(t()) :: map() | nil
   def federation_entity_metadata(%__MODULE__{federation_entity_metadata: metadata}), do: metadata
+
+  @doc """
+  The access-token claim name configured for the stable authorization-grant
+  identifier, or `nil` when the claim is disabled.
+
+  The identifier is distinct from the OpenID Connect `sid` browser-session
+  claim. See the module configuration docs for lifecycle and privacy details.
+  """
+  @spec authorization_grant_id_claim(t()) :: String.t() | nil
+  def authorization_grant_id_claim(%__MODULE__{authorization_grant_id_claim: claim}), do: claim
 
   @doc """
   The RFC 8628 §3.2 verification URI shown to the user: the configured
@@ -2964,6 +2996,7 @@ defmodule AttestoPhoenix.Config do
     validate_resource_indicators!(config)
     validate_resource_metadata!(config)
     validate_resource_metadata_resolver!(config)
+    validate_authorization_grant_id_claim!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
@@ -3013,6 +3046,37 @@ defmodule AttestoPhoenix.Config do
     validate_native_apps!(config)
 
     config
+  end
+
+  # The token core owns its registered claims, while AttestoPhoenix owns
+  # `client_id` and the OIDC claims-request/OID4VCI entitlement passthroughs.
+  # `sid` is intentionally rejected even though it is not a core access-token
+  # claim: OIDC gives it the incompatible meaning of an OP browser session
+  # identifier. A configured grant-id name must not silently shadow any of
+  # those values.
+  @authorization_grant_id_claim_conflicts ~w(
+    iss aud exp iat nbf jti sub scope typ cnf acr auth_time principal_kind
+    client_id claims credential_configuration_ids sid
+  )
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: nil}), do: :ok
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: claim})
+       when is_binary(claim) and claim != "" do
+    if claim in @authorization_grant_id_claim_conflicts do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :authorization_grant_id_claim #{inspect(claim)} collides " <>
+              "with a protocol- or library-owned claim. Configure a collision-resistant " <>
+              "claim name under a namespace the host controls; do not reuse OIDC sid."
+    end
+
+    :ok
+  end
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: claim}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :authorization_grant_id_claim must be nil or a non-empty " <>
+            "string naming the access-token claim; got #{inspect(claim)}."
   end
 
   defp validate_mtls_client_auth!(%__MODULE__{} = config) do

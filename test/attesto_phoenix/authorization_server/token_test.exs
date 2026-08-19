@@ -21,6 +21,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   @code_verifier "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
   @code_challenge "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
   @redirect_uri "https://client.example/cb"
+  @authorization_grant_id_claim "https://api.example/claims/oauth_grant_id"
   @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
   @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
   @subject_token_type_access_token "urn:ietf:params:oauth:token-type:access_token"
@@ -97,7 +98,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     JSON.decode!(json)[key]
   end
 
-  defp start_code_store(subject, scope) do
+  defp start_code_store(subject, scope, opts \\ []) do
     case start_supervised(ETS) do
       {:ok, _pid} -> :ok
       {:error, {:already_started, _pid}} -> :ok
@@ -105,19 +106,25 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
     ETS.reset()
 
-    {:ok, code} =
-      Attesto.AuthorizationCode.issue(ETS, %{
+    attrs =
+      %{
         client_id: "client-1",
         redirect_uri: @redirect_uri,
         scope: scope,
         subject: subject,
         code_challenge: @code_challenge,
         code_challenge_method: "S256"
-      })
+      }
+      |> put_optional_test_value(:family_id, Keyword.get(opts, :family_id))
+
+    {:ok, code} = Attesto.AuthorizationCode.issue(ETS, attrs)
 
     Process.put(:auth_code, code)
     ETS
   end
+
+  defp put_optional_test_value(map, _key, nil), do: map
+  defp put_optional_test_value(map, key, value), do: Map.put(map, key, value)
 
   # A code carrying the RFC 9470 authentication context the authorize controller
   # would have recorded (acr/auth_time in the code's claims).
@@ -226,6 +233,17 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     struct!(Request, fields)
   end
 
+  defp authorization_code_request(config) do
+    request(config,
+      grant_type: "authorization_code",
+      params: %{
+        "code" => Process.get(:auth_code),
+        "code_verifier" => @code_verifier,
+        "redirect_uri" => @redirect_uri
+      }
+    )
+  end
+
   describe "client_credentials grant (RFC 6749 §4.4)" do
     test "returns the RFC 6749 §5.1 body and a :token_issued event as data" do
       config = config()
@@ -256,6 +274,27 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                sender_constraint: :none,
                cnf: nil
              }
+    end
+
+    test "cannot inherit a host-fabricated authorization-grant id" do
+      config =
+        config(
+          authorization_grant_id_claim: @authorization_grant_id_claim,
+          build_principal: fn client, subject, scope ->
+            %{
+              kind: "client",
+              sub: ensure_sub(subject),
+              scopes: scope,
+              claims: %{
+                "client_id" => client.id,
+                @authorization_grant_id_claim => "host-spoof"
+              }
+            }
+          end
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, request(config, []))
+      refute claim!(response.access_token, @authorization_grant_id_claim)
     end
 
     test "RFC 8707: an allow-listed resource sets the access token aud to that resource" do
@@ -361,6 +400,97 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "authorization_code grant (RFC 6749 §4.1)" do
+    test "grant id is stable across initial access, refresh rotation, and lost-response retry" do
+      family_id = "grant-family-1"
+      code_store = start_code_store("oc_user-1", ["offline_access"], family_id: family_id)
+      refresh_store = start_refresh_store()
+
+      config =
+        config(
+          code_store: code_store,
+          refresh_store: refresh_store,
+          authorization_grant_id_claim: @authorization_grant_id_claim
+        )
+
+      assert {:ok, initial, _events} = Token.issue(config, authorization_code_request(config))
+      assert claim!(initial.access_token, @authorization_grant_id_claim) == family_id
+      initial_jti = claim!(initial.access_token, "jti")
+
+      assert {:ok, initial_refresh} = refresh_store.get(Attesto.Secret.hash(initial.refresh_token))
+      assert initial_refresh.family_id == family_id
+
+      refresh_request =
+        request(config,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => initial.refresh_token}
+        )
+
+      assert {:ok, refreshed, _events} = Token.issue(config, refresh_request)
+      assert claim!(refreshed.access_token, @authorization_grant_id_claim) == family_id
+      refreshed_jti = claim!(refreshed.access_token, "jti")
+      refute refreshed_jti == initial_jti
+
+      assert {:ok, retried, _events} = Token.issue(config, refresh_request)
+      assert retried.refresh_token == refreshed.refresh_token
+      assert claim!(retried.access_token, @authorization_grant_id_claim) == family_id
+      refute claim!(retried.access_token, "jti") in [initial_jti, refreshed_jti]
+    end
+
+    test "is absent by default" do
+      code_store = start_code_store("oc_user-1", ["read"], family_id: "grant-family-default")
+      config = config(code_store: code_store)
+
+      assert {:ok, response, _events} = Token.issue(config, authorization_code_request(config))
+      refute claim!(response.access_token, @authorization_grant_id_claim)
+    end
+
+    test "access-only grants retain correlation without claiming a persisted refresh family" do
+      family_id = "grant-family-access-only"
+      code_store = start_code_store("oc_user-1", ["read"], family_id: family_id)
+
+      config =
+        config(
+          code_store: code_store,
+          authorization_grant_id_claim: @authorization_grant_id_claim
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, authorization_code_request(config))
+      assert claim!(response.access_token, @authorization_grant_id_claim) == family_id
+      refute Map.has_key?(response, :refresh_token)
+    end
+
+    test "separate authorizations are distinct and override a host-fabricated claim" do
+      first_family = "grant-family-a"
+      code_store = start_code_store("oc_user-1", ["read"], family_id: first_family)
+
+      config =
+        config(
+          code_store: code_store,
+          authorization_grant_id_claim: @authorization_grant_id_claim,
+          build_principal: fn client, subject, scope ->
+            %{
+              kind: "client",
+              sub: ensure_sub(subject),
+              scopes: scope,
+              claims: %{
+                "client_id" => client.id,
+                @authorization_grant_id_claim => "host-spoof"
+              }
+            }
+          end
+        )
+
+      assert {:ok, first, _events} = Token.issue(config, authorization_code_request(config))
+      assert claim!(first.access_token, @authorization_grant_id_claim) == first_family
+
+      second_family = "grant-family-b"
+      start_code_store("oc_user-1", ["read"], family_id: second_family)
+
+      assert {:ok, second, _events} = Token.issue(config, authorization_code_request(config))
+      assert claim!(second.access_token, @authorization_grant_id_claim) == second_family
+      refute second_family == first_family
+    end
+
     test "one authenticated client_id snapshot binds code, ID Token, refresh family, and rotation" do
       code_store = start_code_store("oc_user-1", ["openid", "offline_access"])
       refresh_store = start_refresh_store()
@@ -684,6 +814,58 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert is_binary(response.access_token)
       assert response.scope == "read"
       assert claim!(response.access_token, "sub") == "oc_user-1"
+      refute claim!(response.access_token, @authorization_grant_id_claim)
+    end
+
+    test "grant id matches the persisted initial refresh family" do
+      refresh_store = start_refresh_store()
+
+      config =
+        device_config(
+          refresh_store: refresh_store,
+          issue_refresh_token?: fn _client, _scope -> true end,
+          authorization_grant_id_claim: @authorization_grant_id_claim
+        )
+
+      %{device_code: dc, user_code: uc} = issue_device_code(["read"])
+      :ok = Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, uc, %{subject: "user-1", scope: ["read"]})
+
+      assert {:ok, response, _events} = Token.issue(config, device_request(config, dc))
+      grant_id = claim!(response.access_token, @authorization_grant_id_claim)
+      assert is_binary(grant_id) and grant_id != ""
+
+      assert {:ok, refresh} = refresh_store.get(Attesto.Secret.hash(response.refresh_token))
+      assert refresh.family_id == grant_id
+    end
+
+    test "separate access-only device grants receive distinct correlation ids" do
+      config = device_config(authorization_grant_id_claim: @authorization_grant_id_claim)
+
+      %{device_code: first_dc, user_code: first_uc} = issue_device_code(["read"])
+      %{device_code: second_dc, user_code: second_uc} = issue_device_code(["read"])
+
+      :ok =
+        Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, first_uc, %{
+          subject: "user-1",
+          scope: ["read"]
+        })
+
+      :ok =
+        Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, second_uc, %{
+          subject: "user-1",
+          scope: ["read"]
+        })
+
+      assert {:ok, first, _events} = Token.issue(config, device_request(config, first_dc))
+      assert {:ok, second, _events} = Token.issue(config, device_request(config, second_dc))
+
+      first_id = claim!(first.access_token, @authorization_grant_id_claim)
+      second_id = claim!(second.access_token, @authorization_grant_id_claim)
+      assert is_binary(first_id) and first_id != ""
+      assert is_binary(second_id) and second_id != ""
+      refute first_id == second_id
+      refute Map.has_key?(first, :refresh_token)
+      refute Map.has_key?(second, :refresh_token)
     end
 
     test "an authenticated snapshot redeems without a host client_id callback" do
@@ -749,7 +931,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     end
 
     test "redeems the offer and binds credential_configuration_ids into the access token" do
-      config = pre_authorized_config()
+      config = pre_authorized_config(authorization_grant_id_claim: @authorization_grant_id_claim)
       code = issue_pre_authorized_code()
 
       assert {:ok, response, [%Event{name: :token_issued, grant_type: "pre-authorized_code"}]} =
@@ -759,6 +941,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert response.scope == "credential"
       assert claim!(response.access_token, "sub") == "oc_user-1"
       assert claim!(response.access_token, "credential_configuration_ids") == ["UniversityDegreeCredential"]
+      refute claim!(response.access_token, @authorization_grant_id_claim)
     end
 
     test "a public client with no client authentication may redeem the grant" do
@@ -924,6 +1107,62 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert claim!(response.id_token, "auth_time") == auth_time
       # RFC 9470: the access token carries acr for step-up enforcement.
       assert claim!(response.access_token, "acr") == "urn:mace:incommon:iap:silver"
+      refute claim!(response.access_token, @authorization_grant_id_claim)
+    end
+
+    test "grant id matches the persisted initial refresh family" do
+      refresh_store = start_refresh_store()
+
+      config =
+        ciba_config(
+          refresh_store: refresh_store,
+          issue_refresh_token?: fn _client, _scope -> true end,
+          authorization_grant_id_claim: @authorization_grant_id_claim
+        )
+
+      %{auth_req_id: auth_req_id} = issue_ciba(["openid"])
+
+      {:ok, _} =
+        Attesto.CIBA.approve(Attesto.CIBAStore.ETS, auth_req_id, %{
+          subject: "user-1",
+          scope: ["openid"]
+        })
+
+      assert {:ok, response, _events} = Token.issue(config, ciba_request(config, auth_req_id))
+      grant_id = claim!(response.access_token, @authorization_grant_id_claim)
+      assert is_binary(grant_id) and grant_id != ""
+
+      assert {:ok, refresh} = refresh_store.get(Attesto.Secret.hash(response.refresh_token))
+      assert refresh.family_id == grant_id
+    end
+
+    test "separate access-only CIBA grants receive distinct correlation ids" do
+      config = ciba_config(authorization_grant_id_claim: @authorization_grant_id_claim)
+      %{auth_req_id: first_id} = issue_ciba(["openid"])
+      %{auth_req_id: second_id} = issue_ciba(["openid"])
+
+      {:ok, _} =
+        Attesto.CIBA.approve(Attesto.CIBAStore.ETS, first_id, %{
+          subject: "user-1",
+          scope: ["openid"]
+        })
+
+      {:ok, _} =
+        Attesto.CIBA.approve(Attesto.CIBAStore.ETS, second_id, %{
+          subject: "user-1",
+          scope: ["openid"]
+        })
+
+      assert {:ok, first, _events} = Token.issue(config, ciba_request(config, first_id))
+      assert {:ok, second, _events} = Token.issue(config, ciba_request(config, second_id))
+
+      first_grant_id = claim!(first.access_token, @authorization_grant_id_claim)
+      second_grant_id = claim!(second.access_token, @authorization_grant_id_claim)
+      assert is_binary(first_grant_id) and first_grant_id != ""
+      assert is_binary(second_grant_id) and second_grant_id != ""
+      refute first_grant_id == second_grant_id
+      refute Map.has_key?(first, :refresh_token)
+      refute Map.has_key?(second, :refresh_token)
     end
 
     test "an authenticated snapshot binds CIBA access and ID Tokens without a host callback" do
@@ -965,6 +1204,70 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "token exchange grant (RFC 8693)" do
+    test "does not inherit the subject token's authorization-grant id" do
+      family_id = "grant-family-exchange"
+      code_store = start_code_store("oc_user-1", ["read"], family_id: family_id)
+
+      config =
+        config(
+          code_store: code_store,
+          authorization_grant_id_claim: @authorization_grant_id_claim
+        )
+
+      assert {:ok, subject_response, _events} = Token.issue(config, authorization_code_request(config))
+      assert claim!(subject_response.access_token, @authorization_grant_id_claim) == family_id
+
+      exchange_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, exchanged, _events} = Token.issue(config, exchange_request)
+      refute claim!(exchanged.access_token, @authorization_grant_id_claim)
+    end
+
+    test "strips a configured grant-id key carried only as a subject extra claim" do
+      subject_config =
+        config(
+          build_principal: fn client, subject, scope ->
+            %{
+              kind: "client",
+              sub: ensure_sub(subject),
+              scopes: scope,
+              claims: %{
+                "client_id" => client.id,
+                @authorization_grant_id_claim => "subject-extra"
+              }
+            }
+          end
+        )
+
+      assert {:ok, subject_response, _events} =
+               Token.issue(subject_config, request(subject_config, params: %{"scope" => "read"}))
+
+      assert claim!(subject_response.access_token, @authorization_grant_id_claim) == "subject-extra"
+
+      exchange_config = config(authorization_grant_id_claim: @authorization_grant_id_claim)
+
+      exchange_request =
+        request(exchange_config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, exchanged, _events} = Token.issue(exchange_config, exchange_request)
+      refute claim!(exchanged.access_token, @authorization_grant_id_claim)
+    end
+
     test "a token_exchange token_issued event carries bearer sender metadata" do
       config = config()
       subject_request = request(config, params: %{"scope" => "read write"})

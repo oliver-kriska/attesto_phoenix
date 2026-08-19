@@ -44,7 +44,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   `invalid_request` without leaking detail; the underlying reason is logged.
   """
 
-  alias Attesto.{AuthorizationCode, DeviceCode, IDToken, RefreshToken, ResourceIndicator}
+  alias Attesto.{AuthorizationCode, DeviceCode, IDToken, RefreshToken, ResourceIndicator, Secret}
   alias AttestoPhoenix.AuthorizationServer.JwtBearer
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
@@ -232,7 +232,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             access_token_claims(grant),
+             Map.merge(
+               access_token_claims(grant),
+               authorization_grant_id_claims(config, grant.family_id)
+             ),
              # RFC 8707 §2.2: the access token's `aud` is the resource set the
              # user authorized (bound to the code), optionally narrowed by a
              # request-time `resource` — never widened by one. RFC 9470: carry
@@ -302,7 +305,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             %{},
+             authorization_grant_id_claims(config, rotated.family_id),
              # RFC 9470: the refresh context carries the ORIGINAL acr/auth_time
              # (never re-stamped on rotation), so the refreshed access token
              # reports the real authentication event.
@@ -345,6 +348,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, grant} <- redemption,
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
+         authorization_grant_id = new_authorization_grant_id(config),
          {:ok, response} <-
            mint(
              request,
@@ -352,13 +356,24 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             %{},
+             authorization_grant_id_claims(config, authorization_grant_id),
              # RFC 8707 aud from the bound resource set; RFC 9470 acr/auth_time
              # the verification page recorded onto the approved code.
              audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
            ) do
       issued = token_issued_event(request, scope, "device_code", token_type, binding)
-      maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued], "device_code")
+
+      maybe_issue_refresh_token(
+        request,
+        grant,
+        scope,
+        token_type,
+        binding,
+        response,
+        [issued],
+        grant_type: "device_code",
+        family_id: authorization_grant_id
+      )
     end
   end
 
@@ -409,6 +424,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, grant} <- redemption,
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
+         authorization_grant_id = new_authorization_grant_id(config),
          {:ok, response} <-
            mint(
              request,
@@ -416,7 +432,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             %{},
+             authorization_grant_id_claims(config, authorization_grant_id),
              # RFC 8707 aud from the bound resource set; RFC 9470 acr/auth_time
              # the CIBA approval recorded (on the Grant struct, not in claims).
              audience_opts(audience) ++ ciba_auth_context_opts(grant)
@@ -436,7 +452,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         binding,
         response,
         [issued],
-        "ciba"
+        grant_type: "ciba",
+        family_id: authorization_grant_id
       )
     end
   end
@@ -1101,16 +1118,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # that token request. An mTLS-bound request issues no DPoP binding on the
   # refresh token. The plaintext token is added to the RFC 6749 §5.1 body;
   # only its hash is persisted (see `Attesto.RefreshToken`).
-  defp maybe_issue_refresh_token(
-         request,
-         grant,
-         scope,
-         token_type,
-         binding,
-         response,
-         events,
-         grant_type \\ "authorization_code"
-       ) do
+  defp maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, events, refresh_opts \\ []) do
     %{config: config, client: client} = request
 
     if refresh_store = grant_store(config, :refresh_store) do
@@ -1123,7 +1131,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
           refresh_store,
           response,
           events,
-          grant_type
+          refresh_opts
         )
       else
         {:ok, response, events}
@@ -1133,7 +1141,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp issue_initial_refresh_token(request, grant, scope, sender, refresh_store, response, events, grant_type) do
+  defp issue_initial_refresh_token(request, grant, scope, sender, refresh_store, response, events, refresh_opts) do
     %{config: config, client: client} = request
     {token_type, binding} = sender
 
@@ -1157,18 +1165,27 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # `revoke_reused_family/2`). When the code carried no `family_id`,
     # `put_optional_kw/3` drops the option, a fresh family is generated, and
     # reuse detection simply has no family to revoke.
-    # `Map.get/2` (not `grant.family_id`) so this path is shared with grants
-    # whose struct has no `family_id` (the RFC 8628 device grant): a single-use
-    # device code has no code-reuse family to link, so the absent id yields a
-    # fresh family — exactly the intended behavior.
+    # Device and CIBA grants have no stored family id at redemption, so the
+    # configured grant-identity path generates one before minting the access
+    # token and passes it in `refresh_opts`. With the feature disabled that
+    # override is absent and core starts a fresh family exactly as before.
     issue_opts =
       [ttl: config.refresh_token_ttl]
-      |> put_optional_kw(:family_id, Map.get(grant, :family_id))
+      |> put_optional_kw(:family_id, Keyword.get(refresh_opts, :family_id) || Map.get(grant, :family_id))
 
     case RefreshToken.issue(refresh_store, context, issue_opts) do
       {:ok, %{token: token}} ->
         response = Map.put(response, :refresh_token, token)
-        issued = refresh_issued_event(request, scope, grant_type, token_type, binding)
+
+        issued =
+          refresh_issued_event(
+            request,
+            scope,
+            Keyword.get(refresh_opts, :grant_type, "authorization_code"),
+            token_type,
+            binding
+          )
+
         {:ok, response, events ++ [issued]}
 
       {:error, reason} ->
@@ -1454,7 +1471,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          mint_extra_opts
        ) do
     with {:ok, principal} <- build_principal(config, client, subject, scope),
-         principal = merge_principal_claims(principal, extra_claims),
+         principal = merge_principal_claims(config, principal, extra_claims),
          {:ok, principal} <- put_access_token_client_id(principal, token_client_id(request)),
          {:ok, minted} <-
            Attesto.Token.mint(
@@ -1516,7 +1533,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
            scopes: scope,
            claims:
              claims
-             |> exchange_extra_claims(kind_claim)
+             |> exchange_extra_claims(kind_claim, config)
              |> Map.put("client_id", authenticated_client_id)
          },
          {:ok, minted} <-
@@ -1539,12 +1556,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp exchange_extra_claims(claims, principal_kind_claim) do
+  defp exchange_extra_claims(claims, principal_kind_claim, config) do
     # `acr` / `auth_time` are reserved: an exchanged (machine-authorized) token
     # must not inherit the subject token's authentication context, which would
     # let token exchange forge a step-up-satisfying token (RFC 9470).
     reserved =
-      MapSet.new(~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++ [principal_kind_claim])
+      MapSet.new(
+        ~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++
+          [principal_kind_claim, Config.authorization_grant_id_claim(config)]
+      )
 
     claims
     |> Enum.reject(fn {key, _value} -> MapSet.member?(reserved, key) end)
@@ -1674,16 +1694,57 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     }
   end
 
-  defp merge_principal_claims(principal, extra_claims) when map_size(extra_claims) == 0, do: principal
+  # A configured claim exposes the stable authorization-grant identity already
+  # used internally as the refresh-token family id. Authorization-code grants
+  # receive it at the authorization endpoint; refresh rotation returns the same
+  # id. Device and CIBA grants generate it once at successful redemption and
+  # pass it into initial refresh issuance. No configured claim means no new id
+  # or token member on those paths, preserving existing behavior exactly.
+  defp authorization_grant_id_claims(config, authorization_grant_id) do
+    case Config.authorization_grant_id_claim(config) do
+      claim
+      when is_binary(claim) and claim != "" and is_binary(authorization_grant_id) and
+             authorization_grant_id != "" ->
+        %{claim => authorization_grant_id}
 
-  defp merge_principal_claims(principal, extra_claims) do
-    claims =
-      case Map.get(principal, :claims) do
-        claims when is_map(claims) -> Map.merge(claims, extra_claims)
-        _ -> extra_claims
-      end
+      _disabled_or_absent ->
+        %{}
+    end
+  end
 
-    Map.put(principal, :claims, claims)
+  defp new_authorization_grant_id(config) do
+    case Config.authorization_grant_id_claim(config) do
+      claim when is_binary(claim) and claim != "" -> Secret.generate(16)
+      _disabled_or_invalid -> nil
+    end
+  end
+
+  # The configured grant-id claim is protocol-owned at this layer. Remove any
+  # value supplied by the host principal builder before merging the grant path's
+  # trusted value. Grant types with no authorization-grant identity therefore
+  # omit the claim instead of letting a host callback fabricate one.
+  defp merge_principal_claims(config, principal, extra_claims) do
+    case Map.fetch(principal, :claims) do
+      {:ok, claims} when is_map(claims) ->
+        claims = claims |> drop_host_grant_id(config) |> Map.merge(extra_claims)
+        Map.put(principal, :claims, claims)
+
+      :error ->
+        Map.put(principal, :claims, extra_claims)
+
+      {:ok, _invalid_claims} when map_size(extra_claims) == 0 ->
+        principal
+
+      {:ok, _invalid_claims} ->
+        Map.put(principal, :claims, extra_claims)
+    end
+  end
+
+  defp drop_host_grant_id(claims, config) do
+    case Config.authorization_grant_id_claim(config) do
+      claim when is_binary(claim) and claim != "" -> Map.delete(claims, claim)
+      _disabled_or_invalid -> claims
+    end
   end
 
   # ── Sender-constraint resolution (RFC 9449 / RFC 8705) ───────────────────
