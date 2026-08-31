@@ -6,6 +6,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add an opt-in, authorization-code-only `:authorization_code_completion`
+  callback. It runs after single-use code redemption and can wrap principal and
+  JWT construction, access-`jti` recording, generation-0 refresh insertion, and
+  code finalization in one host-owned transaction. Refusal or rollback retains
+  the existing spent-but-unfinalized failure semantics. Its continuation is
+  process-bound and one-shot, so repeated, asynchronous, or escaped calls cannot
+  mint or persist another token set. The default path and every other grant type
+  remain unchanged.
+- Add trusted, bounded authorization-code private context through
+  `:authorization_code_private_context`. A host may capture up to 4 KiB of
+  JSON-compatible state from the authorized client, subject, and new family at
+  issuance and read it only from the completion callback. The state is not
+  accepted from client input, merged into authorization claims, emitted in any
+  token, or inherited by token exchange. Ecto-backed code stores gain an
+  additive nullable `private_context` column; existing Ecto consumers must add
+  it before deploying, while opaque custom/ETS stores require no migration.
+
+### Security
+
+- Suppress application SQL logging and Ecto query telemetry for built-in
+  authorization-code store operations that insert or return private context,
+  preventing disclosure through query params, cast params, or decoded results.
+  Unrelated lifecycle operations retain normal observability. Custom stores and
+  database-server logging remain the host's responsibility.
+
+### Upgrade notes
+
+- Ecto-backed consumers must add the nullable `private_context :map` column and
+  upgrade every token/authorization node before enabling either new callback.
+  After disabling or changing private-context policy, allow the deployment's
+  maximum authorization-code lifetime to drain before relying on the new policy;
+  for the supported deployment profile this window is 300 seconds.
+
 ## [2.14.2] - 2026-08-28
 
 ### Added

@@ -368,6 +368,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :nonce, :string, size: <%= @nonce_size %>
         # Opaque request claims round-tripped to redemption.
         add :claims, :map, null: false, default: %{}
+        # Optional host-private authorization state. Kept separate from claims
+        # because claims can shape access and ID tokens; this value is available
+        # only to the authorization-code completion callback.
+        add :private_context, :map
         # Grant family linking this authorization code to descendants that must
         # be revoked if the code is replayed.
         add :family_id, :string, size: <%= @identifier_size %>

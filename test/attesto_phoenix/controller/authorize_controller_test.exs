@@ -139,6 +139,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, base_config(overrides))
   end
 
+  defp passthrough_completion(_context, continuation), do: continuation.()
+
   defp valid_params(extra \\ %{}) do
     Map.merge(
       %{
@@ -230,6 +232,113 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert grant.subject == "user-42"
       assert grant.scope == ["openid", "profile"]
+    end
+
+    test "an absent private-context hook preserves the ordinary stored record" do
+      conn = call(valid_params(%{"authorization_code_private_context" => "client-controlled"}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data, :attesto_phoenix_private_context)
+      refute Map.has_key?(record.data.claims, "authorization_code_private_context")
+    end
+
+    test "the host attaches bounded private context from trusted authorization state" do
+      test_pid = self()
+
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn context ->
+          send(test_pid, {:private_context_issuance, context})
+          %{security_epoch: 42}
+        end
+      )
+
+      conn = call(valid_params(%{"authorization_code_private_context" => "client-controlled"}))
+      code = location_query(conn)["code"]
+      record = TestStore.peek(code)
+
+      assert_receive {:private_context_issuance,
+                      %{client_id: @client_id, subject: "user-42", family_id: family_id} = context}
+
+      assert map_size(context) == 3
+      assert family_id == record.data.family_id
+      assert record.data.attesto_phoenix_private_context == %{"security_epoch" => 42}
+      refute Map.has_key?(record.data.claims, "security_epoch")
+      refute Map.has_key?(record.data.claims, "authorization_code_private_context")
+    end
+
+    test "private context at the exact 4 KiB encoded boundary is accepted" do
+      private_context = %{"payload" => String.duplicate("x", 4_082)}
+      assert byte_size(JSON.encode!(private_context)) == 4_096
+
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context -> private_context end
+      )
+
+      conn = call(valid_params())
+      code = location_query(conn)["code"]
+
+      assert is_binary(code)
+      assert TestStore.peek(code).data.attesto_phoenix_private_context == private_context
+    end
+
+    test "private context one byte beyond the 4 KiB encoded boundary is rejected" do
+      private_context = %{"payload" => String.duplicate("x", 4_083)}
+      assert byte_size(JSON.encode!(private_context)) == 4_097
+
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context -> private_context end
+      )
+
+      conn = call(valid_params())
+
+      assert location_query(conn)["error"] == "server_error"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
+    test "invalid UTF-8 in private context fails without raising or returning a code" do
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context ->
+          %{"invalid_utf8" => <<255>>}
+        end
+      )
+
+      conn = call(valid_params())
+
+      assert location_query(conn)["error"] == "server_error"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
+    test "a nested non-JSON private-context value fails without raising or returning a code" do
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context ->
+          %{"nested" => %{"value" => {:not, :json}}}
+        end
+      )
+
+      conn = call(valid_params())
+
+      assert location_query(conn)["error"] == "server_error"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
+    test "an improper list in private context fails without raising or returning a code" do
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context ->
+          %{"improper_list" => [1 | 2]}
+        end
+      )
+
+      conn = call(valid_params())
+
+      assert location_query(conn)["error"] == "server_error"
+      refute Map.has_key?(location_query(conn), "code")
     end
 
     test "the issued code preserves the OIDC claims request object" do

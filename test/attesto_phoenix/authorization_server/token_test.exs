@@ -12,6 +12,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   use ExUnit.Case, async: false
 
   alias Attesto.CodeStore.ETS
+  alias AttestoPhoenix.AuthorizationCodePrivateContext
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Config, Event, OAuthError}
@@ -97,7 +98,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     JSON.decode!(json)[key]
   end
 
-  defp start_code_store(subject, scope) do
+  defp start_code_store(subject, scope, opts \\ []) do
     case start_supervised(ETS) do
       {:ok, _pid} -> :ok
       {:error, {:already_started, _pid}} -> :ok
@@ -105,15 +106,28 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
     ETS.reset()
 
+    attrs = %{
+      client_id: "client-1",
+      redirect_uri: @redirect_uri,
+      scope: scope,
+      subject: subject,
+      code_challenge: @code_challenge,
+      code_challenge_method: "S256"
+    }
+
+    attrs =
+      case Keyword.get(opts, :family_id) do
+        nil -> attrs
+        family_id -> Map.put(attrs, :family_id, family_id)
+      end
+
     {:ok, code} =
-      Attesto.AuthorizationCode.issue(ETS, %{
-        client_id: "client-1",
-        redirect_uri: @redirect_uri,
-        scope: scope,
-        subject: subject,
-        code_challenge: @code_challenge,
-        code_challenge_method: "S256"
-      })
+      AuthorizationCodePrivateContext.issue(
+        ETS,
+        attrs,
+        Keyword.get(opts, :private_context),
+        []
+      )
 
     Process.put(:auth_code, code)
     ETS
@@ -123,26 +137,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   # never generates one, so `start_code_store/2` above yields `family_id: nil`;
   # this variant is how a test opts into a real authorization-code family.
   defp start_code_store_with_family(subject, scope, family_id) do
-    case start_supervised(ETS) do
-      {:ok, _pid} -> :ok
-      {:error, {:already_started, _pid}} -> :ok
-    end
-
-    ETS.reset()
-
-    {:ok, code} =
-      Attesto.AuthorizationCode.issue(ETS, %{
-        client_id: "client-1",
-        redirect_uri: @redirect_uri,
-        scope: scope,
-        subject: subject,
-        code_challenge: @code_challenge,
-        code_challenge_method: "S256",
-        family_id: family_id
-      })
-
-    Process.put(:auth_code, code)
-    ETS
+    start_code_store(subject, scope, family_id: family_id)
   end
 
   defp grant_id_code_request(config) do
@@ -503,6 +498,45 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                sender_constraint: :none,
                cnf: nil
              }
+    end
+
+    test "the completion callback is isolated from refresh rotation and unrelated grants" do
+      test_pid = self()
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          client_id: "client-1"
+        })
+
+      config =
+        config(
+          refresh_store: refresh_store,
+          authorization_code_completion: fn _context, _continuation ->
+            send(test_pid, :authorization_code_completion_invoked)
+            {:error, :unexpected_grant}
+          end
+        )
+
+      assert {:ok, %{access_token: access_token}, _events} =
+               Token.issue(config, request(config, params: %{"scope" => "read"}))
+
+      assert is_binary(access_token)
+
+      refresh_request =
+        request(config,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => refresh_token}
+        )
+
+      assert {:ok, %{access_token: refreshed, refresh_token: successor}, _events} =
+               Token.issue(config, refresh_request)
+
+      assert is_binary(refreshed)
+      assert is_binary(successor)
+      refute_received :authorization_code_completion_invoked
     end
   end
 
@@ -1189,6 +1223,46 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                sender_constraint: :none,
                cnf: nil
              }
+    end
+
+    test "exchange drops grant-bound credential entitlements but preserves ordinary custom claims" do
+      config =
+        config(
+          build_principal: fn client, subject, scope ->
+            %{
+              kind: "client",
+              sub: ensure_sub(subject),
+              scopes: scope,
+              claims: %{
+                "client_id" => client.id,
+                "credential_configuration_ids" => ["UniversityDegreeCredential"],
+                "tenant_id" => "tenant-7"
+              }
+            }
+          end
+        )
+
+      subject_request = request(config, params: %{"scope" => "read"})
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+
+      assert claim!(subject_response.access_token, "credential_configuration_ids") ==
+               ["UniversityDegreeCredential"]
+
+      assert claim!(subject_response.access_token, "tenant_id") == "tenant-7"
+
+      exchange_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, exchanged, _events} = Token.issue(config, exchange_request)
+      refute claim!(exchanged.access_token, "credential_configuration_ids")
+      assert claim!(exchanged.access_token, "tenant_id") == "tenant-7"
     end
 
     test "scope policy cannot widen the subject token or replace the requested subset" do

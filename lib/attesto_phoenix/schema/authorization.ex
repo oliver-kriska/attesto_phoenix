@@ -39,6 +39,9 @@ defmodule AttestoPhoenix.Schema.Authorization do
       round-tripped into the eventual ID Token.
     * `:claims` - an opaque map of additional request context carried from
       the authorization request to redemption.
+    * `:private_context` - optional, bounded host authorization state. It is
+      persisted separately from token-visible `:claims` and stripped before
+      the core authorization-code grant is hydrated.
 
   ## Lifecycle columns
 
@@ -100,6 +103,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
           cnf: map() | nil,
           nonce: String.t() | nil,
           claims: map() | nil,
+          private_context: map() | nil,
           family_id: String.t() | nil,
           access_token_jti: String.t() | nil,
           access_token_expires_at: DateTime.t() | nil,
@@ -137,6 +141,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
     field :cnf, :map
     field :nonce, :string
     field :claims, :map, default: %{}
+    field :private_context, :map
     field :family_id, :string
     field :access_token_jti, :string
     field :access_token_expires_at, :utc_datetime
@@ -165,6 +170,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
     :cnf,
     :nonce,
     :claims,
+    :private_context,
     :family_id,
     :access_token_jti,
     :access_token_expires_at,
@@ -229,6 +235,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
       cnf: cnf_from_data(data),
       nonce: Map.get(data, :nonce),
       claims: Map.get(data, :claims, %{}),
+      private_context: Map.get(data, :attesto_phoenix_private_context),
       family_id: Map.get(data, :family_id),
       expires_at: unix_to_datetime(Map.get(record, :expires_at)),
       inserted_at: now
@@ -255,19 +262,21 @@ defmodule AttestoPhoenix.Schema.Authorization do
   def to_record(%__MODULE__{} = row) do
     %{
       code_hash: row.code_hash,
-      data: %{
-        client_id: row.client_id,
-        subject: row.subject,
-        scope: row.scope || [],
-        resource: row.resource || [],
-        redirect_uri: row.redirect_uri,
-        code_challenge: row.code_challenge,
-        code_challenge_method: row.code_challenge_method,
-        dpop_jkt: dpop_jkt_from_cnf(row.cnf),
-        nonce: row.nonce,
-        claims: row.claims || %{},
-        family_id: row.family_id
-      },
+      data:
+        %{
+          client_id: row.client_id,
+          subject: row.subject,
+          scope: row.scope || [],
+          resource: row.resource || [],
+          redirect_uri: row.redirect_uri,
+          code_challenge: row.code_challenge,
+          code_challenge_method: row.code_challenge_method,
+          dpop_jkt: dpop_jkt_from_cnf(row.cnf),
+          nonce: row.nonce,
+          claims: row.claims || %{},
+          family_id: row.family_id
+        }
+        |> put_private_context(row.private_context),
       expires_at: datetime_to_unix(row.expires_at)
     }
   end
@@ -311,6 +320,10 @@ defmodule AttestoPhoenix.Schema.Authorization do
   defp dpop_jkt_from_cnf(%{"jkt" => jkt}) when is_binary(jkt), do: jkt
   defp dpop_jkt_from_cnf(%{jkt: jkt}) when is_binary(jkt), do: jkt
   defp dpop_jkt_from_cnf(_cnf), do: nil
+
+  defp put_private_context(data, nil), do: data
+
+  defp put_private_context(data, private_context), do: Map.put(data, :attesto_phoenix_private_context, private_context)
 
   defp unix_to_datetime(nil), do: nil
 
