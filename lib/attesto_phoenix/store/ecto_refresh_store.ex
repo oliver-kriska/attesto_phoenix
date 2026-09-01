@@ -58,6 +58,11 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   # with advisory locks any other subsystem takes. Arbitrary but stable.
   @advisory_lock_namespace 0x4154_5246
 
+  # Every refresh-token query carries or returns security-sensitive token
+  # hashes, family IDs, subjects, or encrypted successor state. Keep transaction
+  # boundary telemetry observable while suppressing only those concrete queries.
+  @sensitive_query_opts [log: false, telemetry_event: nil]
+
   @doc """
   Persists a new (unconsumed) refresh-token record.
 
@@ -89,7 +94,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
         else
           %RefreshToken{}
           |> RefreshToken.insert_changeset(RefreshToken.from_store_record(record))
-          |> repo().insert!()
+          |> repo().insert!(@sensitive_query_opts)
 
           :ok
         end
@@ -114,7 +119,11 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   @impl Attesto.RefreshStore
   @spec get(Attesto.RefreshStore.token_hash()) :: {:ok, Attesto.RefreshStore.entry()} | :error
   def get(token_hash) when is_binary(token_hash) do
-    case repo().get_by(RefreshToken, token_hash: token_hash, family_revoked: false) do
+    case repo().get_by(
+           RefreshToken,
+           [token_hash: token_hash, family_revoked: false],
+           @sensitive_query_opts
+         ) do
       %RefreshToken{} = row -> {:ok, RefreshToken.to_store_record(row)}
       nil -> :error
     end
@@ -144,7 +153,11 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
         where: r.token_hash == ^token_hash and r.consumed == false and r.family_revoked == false,
         select: r
 
-    case repo().update_all(query, set: [consumed: true, consumed_at: consumed_at]) do
+    case repo().update_all(
+           query,
+           [set: [consumed: true, consumed_at: consumed_at]],
+           @sensitive_query_opts
+         ) do
       {1, [row]} ->
         # Won the claim. Report the record as it stood (unconsumed): the next
         # token in the family is minted from it.
@@ -174,7 +187,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
         from r in RefreshToken,
           where: r.token_hash == ^token_hash and r.consumed == true and r.family_revoked == false
 
-      case repo().update_all(query, set: [successor: protected]) do
+      case repo().update_all(query, [set: [successor: protected]], @sensitive_query_opts) do
         {1, _} -> :ok
         {0, _} -> :error
       end
@@ -200,7 +213,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
     repo().transaction(fn ->
       lock_family!(family_id)
       query = from r in RefreshToken, where: r.family_id == ^family_id
-      repo().update_all(query, set: [family_revoked: true])
+      repo().update_all(query, [set: [family_revoked: true]], @sensitive_query_opts)
     end)
 
     :ok
@@ -213,7 +226,11 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   # advisory-lock form takes; the constant first key namespaces these locks to
   # this store so they cannot collide with another subsystem's advisory locks.
   defp lock_family!(family_id) do
-    repo().query!("SELECT pg_advisory_xact_lock($1::int4, hashtext($2))", [@advisory_lock_namespace, family_id])
+    repo().query!(
+      "SELECT pg_advisory_xact_lock($1::int4, hashtext($2))",
+      [@advisory_lock_namespace, family_id],
+      @sensitive_query_opts
+    )
   end
 
   # No row was claimable: either the token is unknown, or it was already
@@ -221,7 +238,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   # never trips reuse detection (there is no family to revoke). No silent
   # reject: each outcome maps to a distinct, explicit return value.
   defp classify_consume_miss(token_hash) do
-    case repo().get_by(RefreshToken, token_hash: token_hash) do
+    case repo().get_by(RefreshToken, [token_hash: token_hash], @sensitive_query_opts) do
       %RefreshToken{family_revoked: true} -> :error
       %RefreshToken{consumed: true} = row -> {:reuse, RefreshToken.to_store_record(row)}
       %RefreshToken{} -> :error
@@ -234,7 +251,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
       from r in RefreshToken,
         where: r.family_id == ^family_id and r.family_revoked == true
 
-    repo().exists?(query)
+    repo().exists?(query, @sensitive_query_opts)
   end
 
   defp to_datetime(%DateTime{} = dt), do: dt

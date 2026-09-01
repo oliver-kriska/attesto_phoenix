@@ -28,12 +28,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   backing repository can make no guarantees, so a missing `:repo` fails
   closed rather than silently no-opping.
 
-  Authorization codes may carry host-private completion context. Operations
-  that insert or return the full row disable application SQL logging and Ecto
-  query telemetry per call so params, cast params, and decoded results cannot
-  expose that state. Lifecycle updates and replay detection select only the
-  columns they report and retain normal observability. This store cannot control
-  database-server logging.
+  Authorization-code rows carry security-sensitive values including code
+  hashes, subjects, family IDs, access-token JTIs, and optional host-private
+  completion context. Every query that reads or writes those rows disables
+  application SQL logging and Ecto query telemetry per call so params, cast
+  params, and decoded results cannot expose that state. This store cannot
+  control database-server logging.
   """
 
   @behaviour Attesto.CodeStore
@@ -43,12 +43,10 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
 
-  # Authorization rows may carry host-private completion state. Ecto SQL query
-  # telemetry includes params/cast_params and decoded results, so suppress both
-  # application logging and telemetry only for calls that insert or return the
-  # full row. Lifecycle updates and narrow replay reads below bind/return no
-  # private context and intentionally retain their normal observability.
-  @private_context_query_opts [log: false, telemetry_event: nil]
+  # Ecto SQL query telemetry includes params/cast_params and decoded results.
+  # Every authorization-row query carries at least one security-sensitive
+  # value, even when it does not select the private-context column.
+  @sensitive_query_opts [log: false, telemetry_event: nil]
 
   @doc """
   Persists an authorization-code record keyed by its `:code_hash`.
@@ -73,7 +71,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     changeset = Authorization.from_record(record)
 
     try do
-      repo().insert!(changeset, @private_context_query_opts)
+      repo().insert!(changeset, @sensitive_query_opts)
     rescue
       exception in Ecto.InvalidChangesetError ->
         redacted = %{exception | changeset: redact_private_context(exception.changeset)}
@@ -111,7 +109,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().update_all(query, [set: [consumed_at: consumed_at]], @private_context_query_opts) do
+    case repo().update_all(query, [set: [consumed_at: consumed_at]], @sensitive_query_opts) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
       {0, _} -> consumed_or_missing(code_hash)
     end
@@ -133,7 +131,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().one(query, @private_context_query_opts) do
+    case repo().one(query, @sensitive_query_opts) do
       nil -> :error
       row -> {:ok, Authorization.to_record(row)}
     end
@@ -150,7 +148,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec mark_consumed(Attesto.CodeStore.code_hash(), Attesto.CodeStore.consumed_meta()) :: :ok
   def mark_consumed(code_hash, _meta) when is_binary(code_hash) do
     query = from a in Authorization, where: a.code_hash == ^code_hash
-    repo().update_all(query, set: [consumed_success: true])
+    repo().update_all(query, [set: [consumed_success: true]], @sensitive_query_opts)
     :ok
   end
 
@@ -160,11 +158,15 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
       when is_binary(family_id) and is_binary(jti) and is_integer(expires_at) do
     query = from a in Authorization, where: a.family_id == ^family_id
 
-    repo().update_all(query,
-      set: [
-        access_token_jti: jti,
-        access_token_expires_at: DateTime.from_unix!(expires_at)
-      ]
+    repo().update_all(
+      query,
+      [
+        set: [
+          access_token_jti: jti,
+          access_token_expires_at: DateTime.from_unix!(expires_at)
+        ]
+      ],
+      @sensitive_query_opts
     )
 
     :ok
@@ -179,7 +181,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
       from a in Authorization,
         where: a.family_id == ^family_id and not is_nil(a.access_token_jti)
 
-    repo().update_all(query, set: [access_token_revoked_at: now])
+    repo().update_all(query, [set: [access_token_revoked_at: now]], @sensitive_query_opts)
     :ok
   end
 
@@ -194,19 +196,19 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
           a.access_token_jti == ^jti and not is_nil(a.access_token_revoked_at) and
             a.access_token_expires_at > ^now
 
-    repo().exists?(query)
+    repo().exists?(query, @sensitive_query_opts)
   end
 
   defp consumed_or_missing(code_hash) do
-    # Select only the three values returned in consumed metadata. A whole-row
-    # read here would place private context in the decoded result carried by Ecto
-    # query telemetry on the attacker-reachable code-replay path.
+    # Select only the three values returned in consumed metadata, but still
+    # suppress query telemetry: the bound code hash and returned family and
+    # subject are security-sensitive even without private context.
     query =
       from a in Authorization,
         where: a.code_hash == ^code_hash,
         select: [:family_id, :subject, :consumed_success]
 
-    case repo().one(query) do
+    case repo().one(query, @sensitive_query_opts) do
       %Authorization{consumed_success: true} = row ->
         {:error, :consumed, Authorization.consumed_meta(row)}
 
