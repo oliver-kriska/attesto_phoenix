@@ -11,6 +11,8 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
 
   use AttestoPhoenix.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias AttestoPhoenix.Schema.RefreshToken
   alias AttestoPhoenix.Store.EctoRefreshStore
   alias Ecto.Adapters.SQL.Sandbox
@@ -85,6 +87,43 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
       successor = entry(%{family_id: fam})
       assert {:error, :family_revoked} = EctoRefreshStore.insert(successor)
       assert :error = EctoRefreshStore.get(successor.token_hash)
+    end
+  end
+
+  describe "sensitive query observability" do
+    test "the refresh lifecycle suppresses token queries but retains unrelated telemetry" do
+      token_hash = "hash-sensitive-#{System.unique_integer([:positive])}"
+      family_id = "fam-sensitive-#{System.unique_integer([:positive])}"
+      subject = "sub-sensitive-#{System.unique_integer([:positive])}"
+      successor_ciphertext_source = "successor-sensitive-#{System.unique_integer([:positive])}"
+
+      e =
+        entry(%{token_hash: token_hash, family_id: family_id})
+        |> with_data(%{subject: subject})
+
+      successor = %{
+        token: successor_ciphertext_source,
+        generation: 1,
+        context: e.data
+      }
+
+      assert_sensitive_queries_suppressed(
+        [token_hash, family_id, subject, successor_ciphertext_source],
+        fn ->
+          assert :ok = EctoRefreshStore.insert(e)
+          assert {:ok, _stored} = EctoRefreshStore.get(token_hash)
+          assert {:ok, _claimed} = EctoRefreshStore.consume(token_hash)
+          assert :ok = EctoRefreshStore.remember_successor(token_hash, successor)
+          assert {:reuse, _reused} = EctoRefreshStore.consume(token_hash)
+          assert :ok = EctoRefreshStore.revoke_family(family_id)
+
+          assert {:error, :family_revoked} =
+                   EctoRefreshStore.insert(entry(%{family_id: family_id}))
+
+          assert :error = EctoRefreshStore.get(token_hash)
+          assert %{rows: [[1]]} = TestRepo.query!("SELECT 1")
+        end
+      )
     end
   end
 
@@ -294,5 +333,66 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
       assert %RefreshToken{family_revoked: false} =
                TestRepo.get_by(RefreshToken, token_hash: keep.token_hash)
     end
+  end
+
+  defp assert_sensitive_queries_suppressed(sensitive_values, operation) do
+    {handler_id, event_ref} = attach_query_handler()
+
+    try do
+      log = capture_log([level: :debug], operation)
+      metadata = receive_query_events(event_ref, [])
+
+      assert Enum.any?(metadata, &(&1.query == "SELECT 1"))
+
+      Enum.each(metadata, fn event_metadata ->
+        rendered = inspect(event_metadata, limit: :infinity, printable_limit: :infinity)
+
+        Enum.each(sensitive_values, fn sensitive_value ->
+          refute rendered =~ sensitive_value
+        end)
+
+        refute event_metadata.query =~ "attesto_refresh_tokens"
+        refute event_metadata.query =~ "pg_advisory_xact_lock"
+      end)
+
+      Enum.each(sensitive_values, fn sensitive_value ->
+        refute log =~ sensitive_value
+      end)
+
+      refute log =~ "attesto_refresh_tokens"
+      refute log =~ "pg_advisory_xact_lock"
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp attach_query_handler do
+    handler_id = {__MODULE__, make_ref()}
+    event_ref = make_ref()
+    event = Keyword.fetch!(TestRepo.config(), :telemetry_prefix) ++ [:query]
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        &__MODULE__.forward_query_event/4,
+        {self(), event_ref}
+      )
+
+    {handler_id, event_ref}
+  end
+
+  defp receive_query_events(event_ref, events) do
+    receive do
+      {:ecto_refresh_store_query, ^event_ref, metadata} ->
+        receive_query_events(event_ref, [metadata | events])
+    after
+      0 -> Enum.reverse(events)
+    end
+  end
+
+  @doc false
+  def forward_query_event(_event, _measurements, metadata, {test_pid, event_ref}) do
+    send(test_pid, {:ecto_refresh_store_query, event_ref, metadata})
   end
 end

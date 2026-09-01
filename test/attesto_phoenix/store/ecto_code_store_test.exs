@@ -186,11 +186,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
     end
   end
 
-  describe "private-context query observability" do
+  describe "sensitive query observability" do
     test "put/1 emits neither query telemetry nor SQL logs" do
       {private_data, sentinel} = private_grant_data()
 
-      assert_private_query_suppressed(sentinel, fn ->
+      assert_sensitive_queries_suppressed(sentinel, fn ->
         assert :ok = EctoCodeStore.put(entry("hash-private-put", private_data))
       end)
 
@@ -202,7 +202,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       {private_data, sentinel} = private_grant_data()
       assert :ok = EctoCodeStore.put(entry("hash-private-get", private_data))
 
-      assert_private_query_suppressed(sentinel, fn ->
+      assert_sensitive_queries_suppressed(sentinel, fn ->
         assert {:ok, %{data: %{attesto_phoenix_private_context: private_context}}} =
                  EctoCodeStore.get("hash-private-get")
 
@@ -214,7 +214,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       {private_data, sentinel} = private_grant_data()
       assert :ok = EctoCodeStore.put(entry("hash-private-take", private_data))
 
-      assert_private_query_suppressed(sentinel, fn ->
+      assert_sensitive_queries_suppressed(sentinel, fn ->
         assert {:ok, %{data: %{attesto_phoenix_private_context: private_context}}} =
                  EctoCodeStore.take("hash-private-take")
 
@@ -222,31 +222,35 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       end)
     end
 
-    test "a consumed take/1 fallback remains observable without exposing private context" do
+    test "a consumed take/1 fallback emits neither query telemetry nor SQL logs" do
       {private_data, sentinel} = private_grant_data(%{family_id: "fam-private-replay"})
       assert :ok = EctoCodeStore.put(entry("hash-private-replay", private_data))
       assert {:ok, _record} = EctoCodeStore.take("hash-private-replay")
       assert :ok = EctoCodeStore.mark_consumed("hash-private-replay", %{})
 
-      {handler_id, event_ref} = attach_query_handler()
-
-      try do
+      assert_sensitive_queries_suppressed(sentinel, fn ->
         assert {:error, :consumed, %{family_id: "fam-private-replay", subject: "subject-1"}} =
                  EctoCodeStore.take("hash-private-replay")
-
-        assert_receive {:ecto_code_store_query, ^event_ref, metadata}
-        refute inspect(metadata) =~ sentinel
-      after
-        :telemetry.detach(handler_id)
-      end
+      end)
     end
 
-    test "operations that cannot carry private context retain query telemetry" do
-      assert :ok = EctoCodeStore.put(entry("hash-telemetry-scope"))
-      assert {:ok, _record} = EctoCodeStore.take("hash-telemetry-scope")
+    test "authorization lifecycle calls suppress hashes, family IDs, and JTIs" do
+      code_hash = "hash-sensitive-lifecycle"
+      family_id = "fam-sensitive-lifecycle"
+      jti = "jti-sensitive-lifecycle"
 
-      assert_query_telemetry(fn ->
-        assert :ok = EctoCodeStore.mark_consumed("hash-telemetry-scope", %{})
+      assert :ok = EctoCodeStore.put(entry(code_hash, grant_data(%{family_id: family_id})))
+      assert {:ok, _record} = EctoCodeStore.take(code_hash)
+
+      assert_sensitive_queries_suppressed([code_hash, family_id, jti], fn ->
+        assert :ok = EctoCodeStore.mark_consumed(code_hash, %{})
+        assert :ok = EctoCodeStore.record_access_token(family_id, jti, @future_seconds)
+        refute EctoCodeStore.access_token_revoked?(jti)
+        assert :ok = EctoCodeStore.revoke_family_access_tokens(family_id)
+        assert EctoCodeStore.access_token_revoked?(jti)
+
+        assert {:error, :consumed, %{family_id: ^family_id, subject: "subject-1"}} =
+                 EctoCodeStore.take(code_hash)
       end)
     end
   end
@@ -294,7 +298,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
     {data, sentinel}
   end
 
-  defp assert_private_query_suppressed(sentinel, operation) do
+  defp assert_sensitive_queries_suppressed(sensitive_values, operation) do
     {handler_id, event_ref} = attach_query_handler()
 
     try do
@@ -302,24 +306,15 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
       refute_received {:ecto_code_store_query, ^event_ref, _metadata}
 
-      if String.contains?(log, sentinel) do
-        flunk("private context appeared in SQL Logger output")
-      end
+      Enum.each(List.wrap(sensitive_values), fn sensitive_value ->
+        if String.contains?(log, sensitive_value) do
+          flunk("security-sensitive value appeared in SQL Logger output")
+        end
+      end)
 
       if log != "" do
         flunk("protected EctoCodeStore operation emitted SQL Logger output")
       end
-    after
-      :telemetry.detach(handler_id)
-    end
-  end
-
-  defp assert_query_telemetry(operation) do
-    {handler_id, event_ref} = attach_query_handler()
-
-    try do
-      operation.()
-      assert_receive {:ecto_code_store_query, ^event_ref, _metadata}
     after
       :telemetry.detach(handler_id)
     end
